@@ -37,6 +37,29 @@ sudo apt-get install python3 python3-tk python3-pil poppler-utils
 pip install Pillow
 ```
 
+### 打包为 .deb 并安装（推荐）
+
+仓库自带 `Makefile`，可以把整个程序打包成符合 FHS 规范的 `.deb`
+安装包，安装后会在应用菜单出现"CAJ 阅读器"图标，可右键 `.caj` 文件
+选择"打开方式 → CAJ 阅读器"，也可双击直接打开。
+
+```bash
+make deb                     # 生成 build/caj-viewer_1.0.0_all.deb
+sudo apt install ./build/caj-viewer_1.0.0_all.deb
+# 之后在终端直接：
+caj-viewer /path/to/file.caj
+# 或者从应用菜单启动 → 不带参数时弹出文件选择对话框
+```
+
+依赖（python3 / python3-tk / poppler-utils 等）由 `Depends:` 字段
+自动声明，`apt` 安装时会一并拉取。
+
+卸载：
+
+```bash
+sudo apt remove caj-viewer
+```
+
 ### 解码 HN/C8 的 JBig 页（可选）
 
 从 [caj2pdf](https://github.com/htlsmile/caj2pdf) 获取 `libjbigdec.so` 后：

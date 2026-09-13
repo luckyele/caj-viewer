@@ -142,11 +142,14 @@ class CAJParser:
         return out
 
 # ---------------- 提取并重建内嵌 PDF ----------------
-def extract_pdf(cap):
+def extract_pdf(cap, blob=None):
     """CAJ 容器第 0x14 字节起存有内嵌 PDF 流的起始指针。
-    读取全部 PDF 对象、补全目录(Catalog)/根 Pages 与 xref，产出一个可用 PDF。"""
-    with open(cap.path, "rb") as f:
-        d = f.read()
+    读取全部 PDF 对象、补全目录(Catalog)/根 Pages 与 xref，产出一个可用 PDF。
+    blob: 预先读好的整文件 bytes（可避免重复 IO，None 时内部读）。"""
+    if blob is None:
+        with open(cap.path, "rb") as f:
+            blob = f.read()
+    d = blob
     ptr = struct.unpack("i", d[0x14:0x18])[0]
     pdf_start = struct.unpack("i", d[ptr:ptr + 4])[0]
     blob = d[pdf_start:]
@@ -572,19 +575,30 @@ class Viewer:
         self.path = path
         self.cap = CAJParser(path)
         self.tmp = tempfile.mkdtemp(prefix="cajview_")
-        try:
-            if self.cap.fmt == "HN":
+        t0 = time.monotonic()
+        # 1) 优先尝试从 sidecar 缓存读提取结果（同一文件二次打开近瞬时）
+        cache_pdf = self._try_load_cache()
+        if cache_pdf is not None:
+            self.pdf = cache_pdf
+        else:
+            try:
+                # 一次 read 复用给所有需要整文件的分支
                 with open(path, "rb") as f:
-                    data = f.read()
-                self.pdf, _ = _build_hn_pdf(data)
-            elif self.cap.fmt == "%PDF":
-                with open(path, "rb") as f:     # 本质是标准 PDF，直接使用
-                    self.pdf = f.read()
-            else:
-                self.pdf, _ = extract_pdf(self.cap)
-        except Exception as e:
-            raise SystemExit("内嵌 PDF 提取失败: %s" % e)
+                    raw = f.read()
+                if self.cap.fmt == "HN":
+                    self.pdf, _ = _build_hn_pdf(raw)
+                elif self.cap.fmt == "%PDF":
+                    self.pdf = raw                       # 本质是标准 PDF，直接使用
+                else:
+                    self.pdf, _ = extract_pdf(self.cap, blob=raw)
+            except Exception as e:
+                raise SystemExit("内嵌 PDF 提取失败: %s" % e)
+            # 2) 解析成功后写 sidecar 缓存（异步线程，避免阻塞主线程）
+            threading.Thread(target=self._save_cache, args=(self.pdf,),
+                             daemon=True).start()
+        # 3) Renderer 创建
         self.rd = Renderer(self.pdf, self.tmp)
+        self._t_extract = time.monotonic() - t0
         self.N = self.cap.page_num
         self.cur = 1
         self.zoom = 1.0
@@ -597,8 +611,13 @@ class Viewer:
         self._resize_job = None          # 窗口尺寸变化的防抖句柄
         self._foot_h = 44                # 底部页垛页脚高度（滚动可视区须扣除）
 
-        self.root = tk.Tk()
+        # className 使 WM_CLASS 与 .desktop 的 StartupWMClass 一致，
+        # GNOME Dock 才能把运行窗口关联到应用图标（否则显示通用齿轮）。
+        self.root = tk.Tk(className="caj-viewer")
         self.root.title("CAJ 阅读器 - %s" % os.path.basename(path))
+        self.root.geometry("800x600")        # 启动窗口尺寸
+        self.root.minsize(640, 480)         # 防止窗口缩得过小导致布局错乱
+        self._set_icon()
         self._setup_style()
         self._build_toolbar()
         self._build_toc()
@@ -621,6 +640,96 @@ class Viewer:
         self.canvas.bind("<Button-5>", lambda e: self._wheel_page(1))
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self._set_page(1)
+        # 4) 预热：在 mainloop 启动前就触发首页渲染，窗口一亮就有图
+        self.rd.get_async(1, lambda _n, _img: None)
+
+    # ----- sidecar 缓存：把"提取/重建 PDF"的结果落到 <源文件>.cajviewer.pdf -----
+    def _cache_path(self):
+        """sidecar 路径：源文件同目录下 <name>.cajviewer.pdf。
+        源文件不可写时（只读介质）会落到 ~/.cache/caj-viewer/。"""
+        try:
+            p = self.path + ".cajviewer.pdf"
+            # 检查同目录是否可写
+            probe = os.path.join(os.path.dirname(p), ".cajviewer.write_probe")
+            with open(probe, "wb") as f:
+                f.write(b"x")
+            os.remove(probe)
+            return p
+        except (OSError, IOError):
+            import hashlib
+            h = hashlib.sha1(os.path.abspath(self.path).encode()).hexdigest()[:16]
+            d = os.path.expanduser("~/.cache/caj-viewer")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                return None
+            return os.path.join(d, "%s.cajviewer.pdf" % h)
+
+    def _try_load_cache(self):
+        """缓存命中条件：源文件 mtime+size 与缓存头一致；读头 32 字节校验。"""
+        cp = self._cache_path()
+        if cp is None or not os.path.exists(cp):
+            return None
+        try:
+            st_src = os.stat(self.path)
+            with open(cp, "rb") as f:
+                head = f.read(64)
+            # 缓存头：源 mtime(ns)|源 size|fmt
+            src_mtime = struct.pack("q", int(st_src.st_mtime * 1e9))
+            src_size = struct.pack("q", st_src.st_size)
+            fmt = self.cap.fmt.encode() if self.cap.fmt else b"?"
+            if not head.startswith(src_mtime + src_size + fmt):
+                return None
+            with open(cp, "rb") as f:
+                f.seek(64)
+                return f.read()
+        except (OSError, IOError, struct.error):
+            return None
+
+    def _save_cache(self, pdf_bytes):
+        cp = self._cache_path()
+        if cp is None:
+            return
+        try:
+            st_src = os.stat(self.path)
+            head = (struct.pack("q", int(st_src.st_mtime * 1e9)) +
+                    struct.pack("q", st_src.st_size) +
+                    (self.cap.fmt or "?").encode())
+            tmp = cp + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(head)
+                f.write(pdf_bytes)
+            os.replace(tmp, cp)
+        except (OSError, IOError):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _set_icon(self):
+        """设置窗口图标：X11 标题栏 + Wayland 任务栏。
+        Tk 内置的 PhotoImage 在某些发行版不包含 PNG handler（取决于编译选项），
+        所以用 PIL 的 ImageTk.PhotoImage 加载，跨平台都可靠。"""
+        from PIL import Image, ImageTk
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "appicon.png"),
+            "/usr/share/icons/hicolor/256x256/apps/caj-viewer.png",
+            os.path.expanduser("~/.local/usr/share/icons/hicolor/256x256/apps/caj-viewer.png"),
+            os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/caj-viewer.png"),
+        ]
+        for p in candidates:
+            if not os.path.exists(p):
+                continue
+            try:
+                icon = ImageTk.PhotoImage(Image.open(p))
+                # True = 同样应用到后续所有 Toplevel（如格式分析对话框）
+                self.root.iconphoto(True, icon)
+                self._icon_ref = icon          # 保引用，防 GC
+                return
+            except Exception as e:
+                print("[caj-viewer] 加载图标失败: %s: %s" % (p, e), file=sys.stderr)
+                continue
+        print("[caj-viewer] 警告：未找到可用图标 (候选: %s)" % candidates, file=sys.stderr)
 
     def _setup_style(self):
         """ttk 主题：以 clam 为基础，统一暗色面板 + 黄铜强调。"""
