@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-caj_viewer.py —— 中国知网 CAJ 文档阅读器
+caj_viewer.py —— CAJ 文档阅读器
 
 功能
 ----
