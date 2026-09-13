@@ -24,7 +24,9 @@ import io
 import sys
 import time
 import glob
+import json
 import ctypes
+import hashlib
 import uuid
 import queue
 import shutil
@@ -32,10 +34,11 @@ import struct
 import tempfile
 import threading
 import subprocess
+from dataclasses import dataclass
 from collections import OrderedDict
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageTk
     import tkinter as tk
     from tkinter import ttk
     import tkinter.font as tkfont
@@ -519,6 +522,45 @@ class Renderer:
                 break
         return out
 
+# ---------------- 内容标记 ----------------
+MARK_COLORS = {"黄": "#F2C94C", "绿": "#7BC96F", "蓝": "#6FB7E8", "红": "#E86F6F"}
+
+@dataclass
+class Annotation:
+    """一个矩形高亮标记：rect 为归一化页面坐标 (0..1)，缩放/翻页不失效。"""
+    page: int                       # 1-based 页号
+    rect: list                      # [x0, y0, x1, y1]，x0<x1, y0<y1
+    color: str = "#F2C94C"
+    id: str = ""
+    created: float = 0.0
+
+    def __post_init__(self):
+        if not self.id:
+            self.id = uuid.uuid4().hex[:12]
+        if not self.created:
+            self.created = time.time()
+
+def _hex_rgb(c):
+    """'#RRGGBB' -> (r, g, b)，非法颜色回退默认黄。"""
+    try:
+        return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+    except Exception:
+        return (0xF2, 0xC9, 0x4C)
+
+def overlay_marks(img, marks):
+    """把高亮以半透明形式烙进页面位图副本（不动 Renderer 缓存原图）。
+    Canvas 无真透明，PIL 合成使标记随图像项平移，滚动/翻页零额外处理。
+    注意：须在 RGB 图上以 RGBA 模式绘制才会做 alpha 混合；若先转成
+    RGBA 图再画，PIL 会整像素替换（alpha 直接写入），正文会被遮没。"""
+    dr = ImageDraw.Draw(img, "RGBA")
+    w, h = img.size
+    for a in marks:
+        x0, y0, x1, y1 = a.rect
+        rgb = _hex_rgb(a.color)
+        dr.rectangle([x0 * w, y0 * h, x1 * w, y1 * h],
+                     fill=rgb + (70,), outline=rgb + (230,), width=1)
+    return img
+
 # ---------------- GUI ----------------
 # 设计主题：“夜读书房”——深黛青墨色书桌上，暖纸页卡浮起，
 # 黄铜(bronze)为唯一强调色；签名元素为底部黄铜“页垛”阅读进度条。
@@ -610,6 +652,10 @@ class Viewer:
         self._card_ids = []              # 页卡所有画布项（阴影/纸/图像）
         self._resize_job = None          # 窗口尺寸变化的防抖句柄
         self._foot_h = 44                # 底部页垛页脚高度（滚动可视区须扣除）
+        self.annos = []                  # 全文档标记（Annotation 列表）
+        self._anno_sel = None            # 拖选中：[(sx, sy), preview_id]，None=未拖选
+        # （注意：不能叫 _anno_drag，会与同名 B1-Motion 处理方法互相遮蔽）
+        self._load_annotations()
 
         # className 使 WM_CLASS 与 .desktop 的 StartupWMClass 一致，
         # GNOME Dock 才能把运行窗口关联到应用图标（否则显示通用齿轮）。
@@ -639,6 +685,11 @@ class Viewer:
         self.canvas.bind("<Button-4>", lambda e: self._wheel_page(-1))
         self.canvas.bind("<Button-5>", lambda e: self._wheel_page(1))
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        # 内容标记：B1 拖选创建高亮（仅标记模式），点击已有标记弹换色/删除菜单。
+        # 滚轮翻页绑定不受影响，两者无冲突。
+        self.canvas.bind("<Button-1>", self._anno_press)
+        self.canvas.bind("<B1-Motion>", self._anno_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._anno_release)
         self._set_page(1)
         # 4) 预热：在 mainloop 启动前就触发首页渲染，窗口一亮就有图
         self.rd.get_async(1, lambda _n, _img: None)
@@ -703,6 +754,74 @@ class Viewer:
         except (OSError, IOError):
             try:
                 os.remove(tmp)
+            except OSError:
+                pass
+
+    # ----- 标记持久化：源文件旁 <name>.annotations.json -----
+    def _anno_path(self):
+        """标记文件路径：优先源文件同目录；不可写时回退
+        ~/.local/share/caj-viewer/annotations/<sha1前16>.json（模式仿 _cache_path）。"""
+        try:
+            p = self.path + ".annotations.json"
+            probe = os.path.join(os.path.dirname(p), ".cajviewer.write_probe")
+            with open(probe, "wb") as f:
+                f.write(b"x")
+            os.remove(probe)
+            return p
+        except (OSError, IOError):
+            h = hashlib.sha1(os.path.abspath(self.path).encode()).hexdigest()[:16]
+            d = os.path.expanduser("~/.local/share/caj-viewer/annotations")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                return None
+            return os.path.join(d, "%s.annotations.json" % h)
+
+    def _load_annotations(self):
+        """读取标记文件；损坏/版本不符则忽略整文件（自动重建）。"""
+        self.annos = []
+        cp = self._anno_path()
+        if cp is None or not os.path.exists(cp):
+            return
+        try:
+            with open(cp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("version") != 1:
+                return
+            for d in data.get("annotations", []):
+                r = d.get("rect")
+                if (isinstance(r, list) and len(r) == 4 and
+                        all(isinstance(v, (int, float)) for v in r)):
+                    self.annos.append(Annotation(
+                        page=int(d.get("page", 1)), rect=r,
+                        color=d.get("color", "#F2C94C"),
+                        id=str(d.get("id", "")),
+                        created=float(d.get("created", 0.0))))
+        except (OSError, IOError, ValueError, TypeError, AttributeError):
+            self.annos = []
+
+    def _save_annotations(self):
+        """立即原子写盘（.tmp + os.replace）。"""
+        cp = self._anno_path()
+        if cp is None:
+            return
+        try:
+            st_src = os.stat(self.path)
+            data = {
+                "version": 1,
+                "source": {"size": st_src.st_size,
+                           "mtime_ns": int(st_src.st_mtime * 1e9)},
+                "annotations": [{"id": a.id, "page": a.page, "rect": a.rect,
+                                 "color": a.color, "created": a.created}
+                                for a in self.annos],
+            }
+            tmp = cp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, cp)
+        except (OSError, IOError):
+            try:
+                os.remove(cp + ".tmp")
             except OSError:
                 pass
 
@@ -778,6 +897,24 @@ class Viewer:
         for txt, cmd in (("放大", self.zoom_in), ("缩小", self.zoom_out),
                          ("格式信息", self.show_info)):
             ttk.Button(bar, text=txt, command=cmd).pack(side=tk.LEFT, padx=2, pady=3)
+        # 内容标记：模式开关 + 当前颜色选择器（底色实时跟随所选颜色）
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+        self.mark_on = tk.BooleanVar(value=False)
+        self.mark_color = tk.StringVar(value=MARK_COLORS["黄"])
+        ttk.Checkbutton(bar, text="标记模式", var=self.mark_on,
+                        command=self._toggle_mark_mode).pack(side=tk.LEFT, padx=2, pady=3)
+        self.mark_btn = tk.Menubutton(bar, text="色", width=2, relief="flat",
+                                      borderwidth=0, cursor="hand2",
+                                      bg=self.mark_color.get(), fg=PAL["ink"],
+                                      activebackground=self.mark_color.get(),
+                                      font=_font("ui", 10, "bold"))
+        mk = tk.Menu(self.mark_btn, tearoff=0, bg=PAL["panel"], fg=PAL["paper"],
+                     activebackground=PAL["brass"], activeforeground=PAL["ink"])
+        for _name, _hexv in MARK_COLORS.items():
+            mk.add_command(label=_name, foreground=_hexv,
+                           command=lambda v=_hexv: self._set_mark_color(v))
+        self.mark_btn["menu"] = mk
+        self.mark_btn.pack(side=tk.LEFT, padx=(2, 8), pady=3)
         # 黄铜“书签”页码
         self.page_lbl = ttk.Label(bar, text="1 / %d" % self.N, style="Page.TLabel")
         self.page_lbl.pack(side=tk.RIGHT, padx=12, pady=3)
@@ -838,6 +975,7 @@ class Viewer:
         # 翻页默认定位到页首；at_bottom 时先给一个超大偏移，
         # 由 _draw 按该页实际高度钳制到页底（连续滚动时的“回到上一页底部”）。
         self.scroll = 10 ** 9 if at_bottom else 0
+        self._anno_cancel()          # 键盘/按钮翻页打断拖选时清预览项
         self._draw()
 
     def _load_toc(self):
@@ -881,6 +1019,9 @@ class Viewer:
         self._max_scroll = max(0, dh - ch_eff)           # 纵向可滚动量
         self.scroll = max(0, min(self.scroll, self._max_scroll))
         small = img.resize((dw, dh), Image.LANCZOS)
+        marks = [a for a in self.annos if a.page == self.cur]
+        if marks:                                   # 当前页有标记：合成高亮层
+            small = overlay_marks(small, marks)
         self.photo = ImageTk.PhotoImage(small)
         self.canvas.delete("all")
         pad = 10                                    # 纸卡内衬边距
@@ -1045,6 +1186,127 @@ class Viewer:
                 self._flip_until = time.monotonic() + 0.15
             else:
                 self._move_page()
+
+    # ----- 内容标记交互 -----
+    def _toggle_mark_mode(self):
+        """标记模式开关：开启为十字光标拖选；关闭恢复默认。"""
+        self._anno_cancel()
+        if self.mark_on.get():
+            self.canvas.config(cursor="crosshair")
+        else:
+            self.canvas.config(cursor="")
+
+    def _set_mark_color(self, hexv):
+        self.mark_color.set(hexv)
+        try:
+            self.mark_btn.config(bg=hexv, activebackground=hexv)
+        except tk.TclError:
+            pass
+
+    def _page_rect(self):
+        """当前页面图像在画布上的位置 (left, top_y, dw, dh)。"""
+        dw, dh = self._disp
+        cw = max(self.canvas.winfo_width(), 50)
+        ch = max(self.canvas.winfo_height(), 50)
+        ch_eff = ch - self._foot_h
+        left = cw / 2 - dw / 2
+        top_y = (ch_eff - dh) / 2 if dh <= ch_eff else -self.scroll
+        return left, top_y, dw, dh
+
+    def _norm_from_canvas(self, x, y):
+        """画布坐标 -> 归一化页面坐标（钳制 0..1，页外拖选自动裁边）。"""
+        left, top_y, dw, dh = self._page_rect()
+        nx = (x - left) / dw if dw else 0.0
+        ny = (y - top_y) / dh if dh else 0.0
+        return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+
+    def _anno_at(self, x, y):
+        """命中测试：返回包含画布点 (x, y) 的当前页标记（后画的优先）。"""
+        if self._disp is None:
+            return None
+        nx, ny = self._norm_from_canvas(x, y)
+        for a in reversed([a for a in self.annos if a.page == self.cur]):
+            x0, y0, x1, y1 = a.rect
+            if x0 <= nx <= x1 and y0 <= ny <= y1:
+                return a
+        return None
+
+    def _anno_press(self, ev):
+        if not self.mark_on.get() or self._disp is None:
+            self._anno_sel = None
+            return
+        self._anno_sel = [(ev.x, ev.y), None]
+
+    def _anno_drag(self, ev):
+        if not self._anno_sel:
+            return
+        (sx, sy), _ = self._anno_sel
+        self.canvas.delete("anno_preview")
+        pid = self.canvas.create_rectangle(sx, sy, ev.x, ev.y,
+                                           outline=self.mark_color.get(),
+                                           width=2, dash=(4, 3),
+                                           tags="anno_preview")
+        self._anno_sel[1] = pid
+
+    def _anno_release(self, ev):
+        if not self._anno_sel:
+            return
+        (sx, sy), _ = self._anno_sel
+        self._anno_sel = None
+        self.canvas.delete("anno_preview")
+        if self._disp is None:
+            return
+        # 位移过小视为点击：命中已有标记则弹出换色/删除菜单
+        if abs(ev.x - sx) < 6 and abs(ev.y - sy) < 6:
+            hit = self._anno_at(ev.x, ev.y)
+            if hit:
+                self._anno_menu(hit, ev.x_root, ev.y_root)
+            return
+        x0, y0 = self._norm_from_canvas(sx, sy)
+        x1, y1 = self._norm_from_canvas(ev.x, ev.y)
+        nx0, nx1 = min(x0, x1), max(x0, x1)
+        ny0, ny1 = min(y0, y1), max(y0, y1)
+        if (nx1 - nx0) * (ny1 - ny0) < 0.0005:      # 过滤误触
+            return
+        a = Annotation(page=self.cur, rect=[nx0, ny0, nx1, ny1],
+                       color=self.mark_color.get())
+        self.annos.append(a)
+        self._save_annotations()
+        self._draw()
+
+    def _anno_cancel(self):
+        """取消进行中的拖选预览（翻页/关闭模式时）。"""
+        self._anno_sel = None
+        try:
+            self.canvas.delete("anno_preview")
+        except tk.TclError:
+            pass
+
+    def _anno_menu(self, anno, x, y):
+        """点击已有标记：弹出换色（四色）+ 删除菜单。"""
+        m = tk.Menu(self.canvas, tearoff=0, bg=PAL["panel"], fg=PAL["paper"],
+                    activebackground=PAL["brass"], activeforeground=PAL["ink"])
+        for _name, _hexv in MARK_COLORS.items():
+            m.add_command(label="改色 · " + _name, foreground=_hexv,
+                          command=lambda a=anno, v=_hexv: self._anno_recolor(a, v))
+        m.add_separator()
+        m.add_command(label="删除标记",
+                      command=lambda a=anno: self._anno_delete(a))
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    def _anno_recolor(self, anno, hexv):
+        anno.color = hexv
+        self._save_annotations()
+        self._draw()
+
+    def _anno_delete(self, anno):
+        if anno in self.annos:
+            self.annos.remove(anno)
+        self._save_annotations()
+        self._draw()
 
     def show_info(self):
         txt = analyze_text(self.cap)
