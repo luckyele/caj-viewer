@@ -68,6 +68,21 @@ for _cand in _JBIG_SO_CANDIDATES:
 del _cand, _JBIG_SO_CANDIDATES
 
 # ---------------- CAJ 头部解析 ----------------
+def _pdf_page_count(path):
+    """统计标准 PDF 的页数：优先用 poppler 的 pdfinfo，失败则回退正则计数。"""
+    try:
+        out = subprocess.run(["pdfinfo", path], capture_output=True,
+                             text=True, timeout=10).stdout
+        m = re.search(r"^Pages:\s+(\d+)", out, re.M)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    with open(path, "rb") as f:
+        d = f.read()
+    return len(re.findall(rb"/Type\s*/Page[^s]", d))
+
+
 # 已知的知网 CAJ 私有魔数：
 #   CAJ   -> 专有 CAJ 容器（内部嵌套 PDF 对象流，本程序主要支持）
 #   HN    -> 另一类专有格式（HN 头，未完整支持正文渲染）
@@ -99,6 +114,10 @@ class CAJParser:
 
     @property
     def page_num(self):
+        if self.fmt == "%PDF":
+            return _pdf_page_count(self.path)
+        if not self.page_off:
+            return 0
         with open(self.path, "rb") as f:
             f.seek(self.page_off); return struct.unpack("i", f.read(4))[0]
 
@@ -558,6 +577,9 @@ class Viewer:
                 with open(path, "rb") as f:
                     data = f.read()
                 self.pdf, _ = _build_hn_pdf(data)
+            elif self.cap.fmt == "%PDF":
+                with open(path, "rb") as f:     # 本质是标准 PDF，直接使用
+                    self.pdf = f.read()
             else:
                 self.pdf, _ = extract_pdf(self.cap)
         except Exception as e:
@@ -941,7 +963,8 @@ def analyze_text(cap):
     L.append("文件头(前4字节): %s" % " ".join("%02X" % b for b in cap.magic))
     L.append("标识文本: %r" % cap.magic.rstrip(b"\x00").decode("latin-1"))
     L.append("格式类别: %s" % cap.fmt)
-    L.append("页面数:   %d" % cap.page_num)
+    if cap.page_off:
+        L.append("页面数:   %d" % cap.page_num)
     if cap.toc_off:
         toc = cap.toc()
         L.append("大纲项数: %d (起始偏移 0x%X)" % (len(toc), cap.toc_off))
