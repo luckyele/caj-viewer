@@ -6,17 +6,20 @@ caj_viewer.py —— CAJ 文档阅读器
 功能
 ----
 1. 分析 .caj 文件的格式（魔数、格式类别、版本、页数、大纲等）。
-2. 提取并重建 CAJ 容器内嵌的 PDF 流（纯 Python 实现，无需 mutool）。
-3. 用 poppler 的 pdftoppm 渲染页面并用 tkinter 以 GUI 形式阅读。
+2. 提取并重建 CAJ 容器内嵌的 PDF 流（纯 Python 实现，无需 mutool）；
+   "KDH 2.00" 新版加密格式按频率分析自动恢复 XOR 密钥并解密。
+3. 用 poppler 的 pdftoppm/pdftohtml 渲染页面并用 tkinter 以 GUI 形式阅读：
+   文本页提取真实文本版面（可任意缩放仍清晰），扫描图片页渲染位图。
 
 用法
 ----
     python3 caj_viewer.py 文献.caj            # 打印格式分析并打开阅读窗口
     python3 caj_viewer.py 文献.caj --info     # 仅打印格式分析，不打开窗口
+    python3 caj_viewer.py                     # 不带参数时弹出文件选择对话框
 
 依赖
 ----
-    python3 + tkinter + Pillow + poppler-utils(pdftoppm)
+    python3 + tkinter + Pillow + poppler-utils(pdftoppm/pdftohtml/pdffonts)
 """
 import os
 import re
@@ -34,13 +37,14 @@ import struct
 import tempfile
 import threading
 import subprocess
-from dataclasses import dataclass
-from collections import OrderedDict
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from collections import OrderedDict, Counter
 
 try:
     from PIL import Image, ImageDraw, ImageTk
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, filedialog, messagebox
     import tkinter.font as tkfont
 except Exception as e:                     # 仅 --info 模式下可以不需要 GUI
     if "--info" not in sys.argv:
@@ -91,7 +95,8 @@ def _pdf_page_count(path):
 #   HN    -> 另一类专有格式（HN 头，未完整支持正文渲染）
 #   \xC8  -> C8 变体
 #   %PDF  -> 其实是标准 PDF，直接改后缀即可
-#   KDH / TEB -> 其他变体
+#   KDH   -> "KDH 2.00" 新版知网下载格式（XOR 加密 PDF，程序自动解密）
+#   TEB   -> 其他变体
 class CAJParser:
     def __init__(self, path):
         self.path = path
@@ -106,7 +111,9 @@ class CAJParser:
             self.fmt = "HN"; self.page_off = 0x90
             self.toc_off = 0x158; self.toc_size = 0x134
         else:
-            fmt = head.rstrip(b"\x00").decode("latin-1")
+            # 魔数后常跟版本/空格/NUL（如 "KDH 2.00 ..."、b"CAJ\x00"），
+            # 按 NUL+空格剥离后再精确匹配已知格式名
+            fmt = head.rstrip(b"\x00 ").decode("latin-1")
             self.fmt = fmt if fmt in ("CAJ", "HN", "%PDF", "KDH", "TEB") else None
             if self.fmt == "CAJ":
                 self.page_off = 0x10; self.toc_off = 0x110; self.toc_size = 0x134
@@ -440,20 +447,132 @@ def _build_hn_pdf(d):
     out += xref + trailer
     return bytes(out), n
 
+# ---------------- KDH 2.00：加密容器解密 ----------------
+# 新版知网下载的文献为 "KDH 2.00 Copyright(C) 2000 CAJCD" 头：
+#   0x3C  int32 -> 尾部明文 XML 元数据（<FileProperty>...）的起点
+#   0xFC  起到该点为止为 XOR 加密体（解密后即为内嵌 PDF）
+# 密钥为 N 字节循环 XOR（实测 6 字节），文件内无明文存放，但 PDF 明文的
+# 字节分布会泄露它：按相位取密文最高频字节 = 密钥字节 ^ 明文最高频字节
+# （PDF 中最高频字节几乎必为 '0'），再用 "endobj" 相邻差分模式投票确定
+# 全局常数即可恢复整把密钥——无需任何固定密钥，任意 KDH 文件通用。
+def _xor_rep(data, key):
+    """data 与循环 key 逐字节异或（借大整数一次异或，C 速度）。"""
+    n = (len(data) + len(key) - 1) // len(key) * len(key)
+    padded = data + b"\x00" * (n - len(data))
+    return (int.from_bytes(padded, "big") ^
+            int.from_bytes(key * (n // len(key)), "big")).to_bytes(n, "big")[:len(data)]
+
+
+def _kdh_pdf(body, key):
+    """用恢复的密钥解出 PDF；无效（无 %PDF 头/无对象）返回 None。"""
+    plain = _xor_rep(body, key)
+    off = plain.find(b"%PDF-")
+    if off < 0:
+        return None
+    pdf = plain[off:]
+    e = pdf.rfind(b"%%EOF")              # 截去 %%EOF 之后的尾部杂讯
+    if e >= 0:
+        pdf = pdf[:e + 5]
+    if not (pdf.count(b"endobj") or pdf.count(b" obj")):
+        return None
+    return pdf
+
+
+def _kdh_try(body, L):
+    """按密钥长度 L 恢复密钥并解密；失败返回 None。"""
+    tops = [Counter(body[i::L]).most_common(1)[0][0] for i in range(L)]
+    cand = _xor_rep(body, bytes(tops))
+    # 若密钥正确，cand = 明文 ^ 常数，其相邻差分序列含 "endobj" 的
+    # 相邻 XOR 模式（与常数无关）；每个命中即投一票确定该常数
+    crib = b"endobj"
+    dpat = bytes(a ^ b for a, b in zip(crib, crib[1:]))
+    z = _xor_rep(cand[:-1], cand[1:])
+    votes = Counter()
+    i = z.find(dpat)
+    while i >= 0:
+        votes[cand[i] ^ crib[0]] += 1
+        i = z.find(dpat, i + 1)
+    if votes:
+        m0, n = votes.most_common(1)[0]
+        if n >= 3:                       # 票数集中：密钥可信
+            return _kdh_pdf(body, bytes(t ^ m0 for t in tops))
+    for m0 in (0x30, 0x00, 0x0D, 0x20):  # 投票不足：按 PDF 常见最高频字节验证
+        pdf = _kdh_pdf(body, bytes(t ^ m0 for t in tops))
+        if pdf is not None:
+            return pdf
+    return None
+
+
+def _kdh_decrypt(d):
+    """解密 KDH 2.00 容器 -> PDF 字节；失败抛 ValueError。"""
+    if len(d) < 0x100:
+        raise ValueError("KDH 文件过小")
+    end = struct.unpack("i", d[0x3C:0x40])[0]
+    if not (0xFC < end <= len(d)):       # 头部异常时兜底：解到文件尾
+        end = len(d)
+    body = d[0xFC:end]
+    if len(body) < 0x200:
+        raise ValueError("KDH 加密体过小")
+    for L in (6, 4, 8, 12, 16, 32, 64):  # 实测为 6，其余为兼容变体
+        pdf = _kdh_try(body, L)
+        if pdf is not None:
+            return pdf
+    raise ValueError("KDH 解密失败：无法恢复 XOR 密钥")
+
+
+# ---------------- 页面版面模型（文本页） ----------------
+@dataclass
+class TextRun:
+    """一段同字体的连续文本，坐标为 PDF 磅、左上原点。"""
+    x: float; y: float; w: float; h: float
+    text: str
+    font: int                       # PageLayout.fonts 的 id
+    bold: bool = False
+    italic: bool = False
+
+@dataclass
+class ImgRun:
+    x: float; y: float; w: float; h: float
+    img: object                     # PIL Image（后台线程已加载）
+
+@dataclass
+class PageLayout:
+    """一页的真实版面：文字 + 插图（坐标单位 PDF 磅，左上原点）。
+    渲染成画布文本项而非位图，缩放任意倍仍清晰锐利。"""
+    w: float
+    h: float
+    fonts: dict = field(default_factory=dict)   # id -> (size_pt, family, color)
+    texts: list = field(default_factory=list)   # [TextRun]
+    imgs: list = field(default_factory=list)    # [ImgRun]
+
 # ---------------- 渲染器 ----------------
 class Renderer:
-    """页面渲染器：pdftoppm 在后台线程执行，主线程绝不阻塞。
-    渲染完成结果放入队列，由 GUI 定时轮询取回。"""
+    """页面渲染器：后台线程执行，主线程绝不阻塞。
+    文本页用 pdftohtml 提取版面（PageLayout），无文本的页（纯扫描图）
+    回退 pdftoppm 位图。结果放入队列，由 GUI 定时轮询取回。"""
     def __init__(self, pdf_bytes, tmpdir):
         self.pdf = os.path.join(tmpdir, "doc.pdf")
+        self.tmpdir = tmpdir
         with open(self.pdf, "wb") as f:
             f.write(pdf_bytes)
         self.cache = OrderedDict()
         self._lock = threading.Lock()
         self._inflight = {}                # 页号 -> [回调列表]，同一页多次请求可复用
-        self._done = queue.Queue()         # (cb, page, img) 结果队列
+        self._done = queue.Queue()         # (cb, page, obj) 结果队列
         self.max = 10                      # LRU 缓存页数（含预取相邻页）
         self.dpi = 120
+        # 整文档无字体（如 HN/C8 图像 PDF、纯扫描件）则完全跳过文本提取
+        self.text_mode = self._probe_fonts()
+
+    def _probe_fonts(self):
+        """pdffonts 列出至少一种字体 -> 可能存在文本层。"""
+        try:
+            out = subprocess.run(["pdffonts", self.pdf], capture_output=True,
+                                 text=True, timeout=20).stdout
+            rows = [ln for ln in out.splitlines()[2:] if ln.strip()]
+            return bool(rows)
+        except Exception:
+            return True                    # 探测失败则逐页尝试，失败自动回退位图
 
     def _store(self, n, img):
         with self._lock:
@@ -471,6 +590,17 @@ class Renderer:
         return None
 
     def _render(self, n):
+        """优先文本版面；失败或无文本（纯扫描页）回退位图。"""
+        if self.text_mode:
+            try:
+                lay = self._render_layout(n)
+            except Exception:
+                lay = None
+            if lay is not None:
+                return lay
+        return self._render_bitmap(n)
+
+    def _render_bitmap(self, n):
         # 每次渲染使用唯一前缀，避免并发渲染互相干扰/误删文件
         out = os.path.join(os.path.dirname(self.pdf), "pg_%d_%s" % (n, uuid.uuid4().hex))
         subprocess.run(["pdftoppm", "-f", str(n), "-l", str(n), "-png",
@@ -486,12 +616,76 @@ class Renderer:
         finally:
             os.remove(png)
 
+    def _render_layout(self, n):
+        """pdftohtml -xml 提取第 n 页版面（坐标/字号均为 PDF 磅）。
+        插图以 <pdf基名>-<页>_<序>.png 落在 PDF 同目录，一并加载。
+        返回 None 表示该页应按位图渲染（无文本 / 整页扫描图 / 提取失败）。"""
+        r = subprocess.run(
+            ["pdftohtml", "-xml", "-q", "-noroundcoord", "-zoom", "1",
+             "-f", str(n), "-l", str(n), "-stdout", "-fmt", "png", self.pdf],
+            capture_output=True, timeout=60,
+            cwd=os.path.dirname(self.pdf))
+        if r.returncode != 0 or not r.stdout:
+            return None
+        return self._parse_layout(r.stdout)
+
+    def _parse_layout(self, xml_bytes):
+        root = ET.fromstring(xml_bytes)      # 传 bytes：输出带 encoding 声明
+        pg = root.find("page")
+        if pg is None:
+            return None
+        W, H = float(pg.get("width", 0)), float(pg.get("height", 0))
+        if W <= 0 or H <= 0:
+            return None
+        fonts = {}
+        for fs in pg.findall("fontspec"):
+            fonts[int(fs.get("id"))] = (float(fs.get("size", 12)),
+                                        fs.get("family", ""),
+                                        fs.get("color", "#000000"))
+        texts, imgs = [], []
+        page_area = W * H
+        for el in pg:
+            if el.tag == "text":
+                t = "".join(el.itertext())
+                if not t.strip():
+                    continue                 # 纯空白占位段（下划线空格等）
+                style = {s.tag for s in el}
+                try:
+                    fid = int(el.get("font", -1))
+                except ValueError:
+                    fid = -1
+                texts.append(TextRun(
+                    float(el.get("left", 0)), float(el.get("top", 0)),
+                    float(el.get("width", 0)), float(el.get("height", 0)),
+                    t, fid, "b" in style, "i" in style))
+            elif el.tag == "image":
+                iw = float(el.get("width", 0) or 0)
+                ih = float(el.get("height", 0) or 0)
+                if iw * ih >= 0.9 * page_area:
+                    return None              # 整页扫描图（含可见 OCR 层）：按位图渲染
+                src = el.get("src") or ""
+                path = os.path.join(self.tmpdir, src)
+                if not src or not os.path.isfile(path):
+                    continue
+                try:
+                    im = Image.open(path); im.load()
+                    if im.mode not in ("RGB", "RGBA"):
+                        im = im.convert("RGB")
+                except Exception:
+                    continue
+                imgs.append(ImgRun(float(el.get("left", 0) or 0),
+                                   float(el.get("top", 0) or 0), iw, ih, im))
+        if not texts:
+            return None                      # 纯图页/空页 -> 位图渲染
+        return PageLayout(W, H, fonts, texts, imgs)
+
     def get_async(self, n, cb):
-        """异步渲染第 n 页，完成后回调 cb(n, img)（img 可能为 None）。
+        """异步渲染第 n 页，完成后回调 cb(n, obj)（obj 可能为 None）。
+        obj 为 PageLayout（文本页）或 PIL Image（位图页）。
         已在缓存则直接回调；渲染中的页可追加回调，随渲染完成一并触发。"""
-        img = self.get(n)
-        if img is not None:
-            cb(n, img)
+        obj = self.get(n)
+        if obj is not None:
+            cb(n, obj)
             return
         with self._lock:
             cbs = self._inflight.setdefault(n, [])
@@ -501,15 +695,15 @@ class Renderer:
             return
         def worker():
             try:
-                im = self._render(n)
+                res = self._render(n)
             except Exception:
-                im = None
+                res = None
             with self._lock:
                 cbs = self._inflight.pop(n, [])
-            if im is not None:
-                self._store(n, im)
+            if res is not None:
+                self._store(n, res)
             for c in cbs:
-                self._done.put((c, n, im))
+                self._done.put((c, n, res))
         threading.Thread(target=worker, daemon=True).start()
 
     def drain(self):
@@ -524,6 +718,7 @@ class Renderer:
 
 # ---------------- 内容标记 ----------------
 MARK_COLORS = {"黄": "#F2C94C", "绿": "#7BC96F", "蓝": "#6FB7E8", "红": "#E86F6F"}
+SEL_FILL = "#BBD6F0"                   # 文本选区底色（淡蓝，画在文字下层）
 
 @dataclass
 class Annotation:
@@ -560,6 +755,100 @@ def overlay_marks(img, marks):
         dr.rectangle([x0 * w, y0 * h, x1 * w, y1 * h],
                      fill=rgb + (70,), outline=rgb + (230,), width=1)
     return img
+
+# ---------------- sidecar 缓存（模块级） ----------------
+# 把"提取/重建 PDF"的结果落到 <源文件>.cajviewer.pdf，同一文件二次打开近瞬时。
+def _cache_path_for(path):
+    """sidecar 路径：源文件同目录下 <name>.cajviewer.pdf。
+    源文件不可写时（只读介质）会落到 ~/.cache/caj-viewer/。"""
+    try:
+        p = path + ".cajviewer.pdf"
+        # 检查同目录是否可写
+        probe = os.path.join(os.path.dirname(p), ".cajviewer.write_probe")
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        os.remove(probe)
+        return p
+    except (OSError, IOError):
+        h = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]
+        d = os.path.expanduser("~/.cache/caj-viewer")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            return None
+        return os.path.join(d, "%s.cajviewer.pdf" % h)
+
+
+def _try_load_cache(path, fmt):
+    """缓存命中条件：源文件 mtime+size 与缓存头一致；读头 32 字节校验。"""
+    cp = _cache_path_for(path)
+    if cp is None or not os.path.exists(cp):
+        return None
+    try:
+        st_src = os.stat(path)
+        with open(cp, "rb") as f:
+            data = f.read()
+        # 缓存头：源 mtime(ns)|源 size|fmt（旧版缓存头实际长 8+8+len(fmt)，
+        # 与本函数旧的 seek(64) 不一致曾导致 PDF 头部被截去 45 字节）
+        src_mtime = struct.pack("q", int(st_src.st_mtime * 1e9))
+        src_size = struct.pack("q", st_src.st_size)
+        fb = fmt.encode() if fmt else b"?"
+        if not data.startswith(src_mtime + src_size + fb):
+            return None
+        # 按内容定位 PDF 起点，兼容头部未补齐 64 字节的新旧缓存
+        # （注意 fmt 本身可能是 %PDF，须带连字符搜索以免错位）
+        off = data.find(b"%PDF-")
+        return data[off:] if 0 <= off else None
+    except (OSError, IOError, struct.error):
+        return None
+
+
+def _save_cache(path, fmt, pdf_bytes):
+    cp = _cache_path_for(path)
+    if cp is None:
+        return
+    try:
+        st_src = os.stat(path)
+        head = (struct.pack("q", int(st_src.st_mtime * 1e9)) +
+                struct.pack("q", st_src.st_size) +
+                (fmt or "?").encode())
+        head = head.ljust(64, b"\x00")     # 头补齐 64B，读取端按 %PDF 定位
+        tmp = cp + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(head)
+            f.write(pdf_bytes)
+        os.replace(tmp, cp)
+    except (OSError, IOError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+# ---------------- 文档装载 ----------------
+def _prepare_doc(path):
+    """解析并提取文档 -> (CAJParser, pdf_bytes)。
+    优先读 sidecar 缓存；未命中则按格式提取（一次 read 复用给所有需要
+    整文件的分支），并异步写缓存（避免阻塞主线程）。
+    供 Viewer 初始化与"打开文件"复用；失败向上抛异常。"""
+    cap = CAJParser(path)
+    if cap.fmt is None:
+        raise ValueError("无法识别的文件类型（未知魔数）。")
+    pdf = _try_load_cache(path, cap.fmt)
+    if pdf is not None:
+        return cap, pdf
+    with open(path, "rb") as f:
+        raw = f.read()
+    if cap.fmt == "HN":
+        pdf, _ = _build_hn_pdf(raw)
+    elif cap.fmt == "%PDF":
+        pdf = raw                           # 本质是标准 PDF，直接使用
+    elif cap.fmt == "KDH":
+        pdf = _kdh_decrypt(raw)             # 新版知网加密格式，自动解密
+    else:
+        pdf, _ = extract_pdf(cap, blob=raw)
+    threading.Thread(target=_save_cache, args=(path, cap.fmt, pdf),
+                     daemon=True).start()
+    return cap, pdf
 
 # ---------------- GUI ----------------
 # 设计主题：“夜读书房”——深黛青墨色书桌上，暖纸页卡浮起，
@@ -605,6 +894,114 @@ def _font(role, size, weight="normal"):
     _FONT_CACHE[key] = r
     return r
 
+# ---- PDF 字体名 -> tkinter 字体（文本页渲染用）----
+_PDF_FONT_CATS = {
+    # 类别 -> 候选字体族（按优先级，运行时与 tkfont.families() 求交集）
+    "cjk_serif": ["Noto Serif CJK SC", "Source Han Serif SC", "Songti SC",
+                  "STSong", "SimSun", "NSimSun", "AR PL UMing CN",
+                  "Droid Sans Fallback", "DejaVu Serif"],
+    "cjk_sans":  ["Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei",
+                  "SimHei", "WenQuanYi Micro Hei", "Droid Sans Fallback",
+                  "DejaVu Sans"],
+    "cjk_kai":   ["KaiTi", "楷体_GB2312", "STKaiti", "AR PL UKai CN",
+                  "AR PL UMing CN", "Droid Sans Fallback"],
+    "lat_serif": ["Times New Roman", "Liberation Serif", "DejaVu Serif",
+                  "Nimbus Roman", "FreeSerif"],
+    "lat_sans":  ["Arial", "Liberation Sans", "DejaVu Sans", "Nimbus Sans",
+                  "FreeSans"],
+    "mono":      ["Courier New", "DejaVu Sans Mono", "Liberation Mono",
+                  "Noto Mono", "FreeMono"],
+}
+_PDF_CAT_KEYS = (                       # 依序匹配（CJK 判定必须先于拉丁）
+    ("cjk_sans",  ("hei", "yahei", "gothic", "heiti", "wentai", "zhonghei")),
+    ("cjk_kai",   ("kai", "xingkai")),
+    ("cjk_serif", ("song", "sun", "fang", "ming", "mingli", "zhengsong",
+                   "xiaobiaosong")),
+    ("lat_serif", ("times", "georgia", "roman", "garamond", "book")),
+    ("lat_sans",  ("arial", "helvetica", "verdana", "calibri", "tahoma",
+                   "sans", "segoe")),
+    ("mono",      ("courier", "mono", "consol")),
+)
+_TK_FAMS = None
+_PDF_FAM_CACHE = {}
+_LAYOUT_FONT_CACHE = {}
+
+def _pdf_font_family(raw):
+    """PDF 字体名（含子集前缀如 'BGFNPF+SimSun'）-> 本机可用的 tk 字体族。"""
+    if raw in _PDF_FAM_CACHE:
+        return _PDF_FAM_CACHE[raw]
+    global _TK_FAMS
+    if _TK_FAMS is None:
+        try:
+            _TK_FAMS = set(tkfont.families())
+        except Exception:
+            _TK_FAMS = set()
+    name = (raw.split("+")[-1] or raw).strip()
+    fam = name if name in _TK_FAMS else ""
+    if not fam:                           # 名称不可用：按关键词归类后选候选
+        low = name.lower().replace(" ", "").replace("-", "")
+        cat = "cjk_serif"                 # 默认按中文衬线（CAJ 文献以中文为主）
+        for c, keys in _PDF_CAT_KEYS:
+            if any(k in low for k in keys):
+                cat = c
+                break
+        for cand in _PDF_FONT_CATS[cat]:
+            if cand in _TK_FAMS:
+                fam = cand
+                break
+    if not fam:
+        fam = "TkDefaultFont"
+    _PDF_FAM_CACHE[raw] = fam
+    return fam
+
+def _layout_font(raw_family, size_pt, scale, bold=False, italic=False):
+    """文本运行 -> tk 字体元组。size 用负数（像素），与屏幕 DPI 无关。"""
+    px = max(1, round(size_pt * scale))
+    fam = _pdf_font_family(raw_family)
+    low = (raw_family or "").lower()
+    if "bold" in low or "black" in low:
+        bold = True
+    if "italic" in low or "oblique" in low:
+        italic = True
+    key = (fam, px, bold, italic)
+    if key not in _LAYOUT_FONT_CACHE:
+        t = (fam, -px)
+        if bold and italic:
+            t = (fam, -px, "bold", "italic")
+        elif bold:
+            t = (fam, -px, "bold")
+        elif italic:
+            t = (fam, -px, "italic")
+        _LAYOUT_FONT_CACHE[key] = t
+    return _LAYOUT_FONT_CACHE[key]
+
+_CHAROFF_CACHE = {}
+
+def _char_offsets(text, ft_tup):
+    """文本在给定 tk 字体下的逐字符累计像素宽（offs[0]=0，长 len(text)+1）。
+    按（字体, 文本）缓存，选区重绘时免重复测量。"""
+    key = (ft_tup, text)
+    offs = _CHAROFF_CACHE.get(key)
+    if offs is None:
+        f = tkfont.Font(font=ft_tup)
+        offs, x = [0], 0
+        for ch in text:
+            x += f.measure(ch)
+            offs.append(x)
+        if len(_CHAROFF_CACHE) > 4096:
+            _CHAROFF_CACHE.clear()
+        _CHAROFF_CACHE[key] = offs
+    return offs
+
+_CJK_SP_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+"
+    r"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])")
+
+def _cjk_tight(s):
+    """去掉夹在两个 CJK 字符（含全角标点）之间的空格。pdftohtml 逐字形
+    输出常用空格分隔相邻汉字，那是版面伪迹——中文词语间本无空格。"""
+    return _CJK_SP_RE.sub("", s)
+
 def _rr(c, x1, y1, x2, y2, r, **kw):
     """圆角矩形（smooth 多边形近似）。"""
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
@@ -612,36 +1009,36 @@ def _rr(c, x1, y1, x2, y2, r, **kw):
            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
     return c.create_polygon(pts, smooth=True, **kw)
 
+def _try_cursor(widget, name):
+    """尝试设置光标名，失败（平台不支持）返回 False。X11 的 I 型光标
+    叫 xterm，Windows/macOS 叫 ibeam。"""
+    try:
+        widget.config(cursor=name)
+        return True
+    except tk.TclError:
+        return False
+
+# 文件选择对话框的类型过滤（一项可含空格分隔的多个通配符）
+OPEN_FILETYPES = [
+    ("CAJ/知网文档", "*.caj *.kdh *.hn *.nh"),
+    ("PDF 文档", "*.pdf"),
+    ("所有文件", "*"),
+]
+
 class Viewer:
     def __init__(self, path):
         self.path = path
-        self.cap = CAJParser(path)
         self.tmp = tempfile.mkdtemp(prefix="cajview_")
         t0 = time.monotonic()
-        # 1) 优先尝试从 sidecar 缓存读提取结果（同一文件二次打开近瞬时）
-        cache_pdf = self._try_load_cache()
-        if cache_pdf is not None:
-            self.pdf = cache_pdf
-        else:
-            try:
-                # 一次 read 复用给所有需要整文件的分支
-                with open(path, "rb") as f:
-                    raw = f.read()
-                if self.cap.fmt == "HN":
-                    self.pdf, _ = _build_hn_pdf(raw)
-                elif self.cap.fmt == "%PDF":
-                    self.pdf = raw                       # 本质是标准 PDF，直接使用
-                else:
-                    self.pdf, _ = extract_pdf(self.cap, blob=raw)
-            except Exception as e:
-                raise SystemExit("内嵌 PDF 提取失败: %s" % e)
-            # 2) 解析成功后写 sidecar 缓存（异步线程，避免阻塞主线程）
-            threading.Thread(target=self._save_cache, args=(self.pdf,),
-                             daemon=True).start()
-        # 3) Renderer 创建
-        self.rd = Renderer(self.pdf, self.tmp)
+        # 解析 + 提取（sidecar 缓存优先，见 _prepare_doc）；失败直接终止
+        try:
+            self.cap, self.pdf = _prepare_doc(path)
+        except Exception as e:
+            raise SystemExit("打开文档失败: %s" % e)
         self._t_extract = time.monotonic() - t0
-        self.N = self.cap.page_num
+        self.rd = Renderer(self.pdf, self.tmp)
+        # KDH 等解密格式头部无页数，回退从解出的 PDF 统计
+        self.N = self.cap.page_num or _pdf_page_count(self.rd.pdf)
         self.cur = 1
         self.zoom = 1.0
         self.scroll = 0                  # 当前页内纵向滚动偏移（显示像素）
@@ -649,12 +1046,16 @@ class Viewer:
         self._flip_until = 0.0           # 翻页后的“落位保护”截止时间
         self._disp = None                # 当前已绘制的显示尺寸 (dw, dh)
         self._img_id = None              # 画布上页面图像项的 id
-        self._card_ids = []              # 页卡所有画布项（阴影/纸/图像）
+        self._top_y = 0.0                # 当前页顶在画布上的 y（滚动平移基准）
+        self._photos = []                # 文本页插图 PhotoImage 引用（防 GC）
         self._resize_job = None          # 窗口尺寸变化的防抖句柄
         self._foot_h = 44                # 底部页垛页脚高度（滚动可视区须扣除）
         self.annos = []                  # 全文档标记（Annotation 列表）
         self._anno_sel = None            # 拖选中：[(sx, sy), preview_id]，None=未拖选
         # （注意：不能叫 _anno_drag，会与同名 B1-Motion 处理方法互相遮蔽）
+        self.text_sel = None             # 文本选区：(page, x0, y0, x1, y1) 归一化坐标
+        self._selpress = None            # 拖选文字起点（画布坐标），None=未拖选
+        self._toast_tok = 0              # 轻提示去重令牌
         self._load_annotations()
 
         # className 使 WM_CLASS 与 .desktop 的 StartupWMClass 一致，
@@ -686,76 +1087,68 @@ class Viewer:
         self.canvas.bind("<Button-5>", lambda e: self._wheel_page(1))
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         # 内容标记：B1 拖选创建高亮（仅标记模式），点击已有标记弹换色/删除菜单。
+        # 非标记模式下 B1 拖选 = 文字选区（松开后 Ctrl+C / 右键复制）。
         # 滚轮翻页绑定不受影响，两者无冲突。
         self.canvas.bind("<Button-1>", self._anno_press)
         self.canvas.bind("<B1-Motion>", self._anno_drag)
         self.canvas.bind("<ButtonRelease-1>", self._anno_release)
+        self.canvas.bind("<Button-3>", self._sel_menu)
+        # 打开文件：Ctrl+O（主窗口级绑定，随 bindtags 冒泡触发）
+        self.root.bind("<Control-o>", self.open_file)
+        self.root.bind("<Control-O>", self.open_file)
+        # 复制选中文本：主窗口级绑定（子部件获得焦点时经由 bindtags 冒泡触发）
+        self.root.bind("<Control-c>", self._copy_selection)
+        self.root.bind("<Control-C>", self._copy_selection)
+        self.root.bind("<Escape>", lambda e: self._clear_selection())
         self._set_page(1)
         # 4) 预热：在 mainloop 启动前就触发首页渲染，窗口一亮就有图
-        self.rd.get_async(1, lambda _n, _img: None)
+        self.rd.get_async(1, lambda _n, _obj: None)
 
-    # ----- sidecar 缓存：把"提取/重建 PDF"的结果落到 <源文件>.cajviewer.pdf -----
-    def _cache_path(self):
-        """sidecar 路径：源文件同目录下 <name>.cajviewer.pdf。
-        源文件不可写时（只读介质）会落到 ~/.cache/caj-viewer/。"""
+    # ----- 打开文件：在当前窗口切换文档 -----
+    def open_file(self, ev=None):
+        """工具栏“打开”/Ctrl+O：弹出文件选择对话框（tk 原生，深色主题外）。"""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="打开文档", filetypes=OPEN_FILETYPES)
+        if path:
+            self.open_path(path)
+
+    def open_path(self, path):
+        """载入新文档。解析/渲染器全部就绪后才切换状态：失败弹窗提示并
+        保留原文档；成功则重置阅读状态并刷新标题/大纲/页码，窗口不重建。"""
+        tmp = None
         try:
-            p = self.path + ".cajviewer.pdf"
-            # 检查同目录是否可写
-            probe = os.path.join(os.path.dirname(p), ".cajviewer.write_probe")
-            with open(probe, "wb") as f:
-                f.write(b"x")
-            os.remove(probe)
-            return p
-        except (OSError, IOError):
-            import hashlib
-            h = hashlib.sha1(os.path.abspath(self.path).encode()).hexdigest()[:16]
-            d = os.path.expanduser("~/.cache/caj-viewer")
-            try:
-                os.makedirs(d, exist_ok=True)
-            except OSError:
-                return None
-            return os.path.join(d, "%s.cajviewer.pdf" % h)
-
-    def _try_load_cache(self):
-        """缓存命中条件：源文件 mtime+size 与缓存头一致；读头 32 字节校验。"""
-        cp = self._cache_path()
-        if cp is None or not os.path.exists(cp):
-            return None
-        try:
-            st_src = os.stat(self.path)
-            with open(cp, "rb") as f:
-                head = f.read(64)
-            # 缓存头：源 mtime(ns)|源 size|fmt
-            src_mtime = struct.pack("q", int(st_src.st_mtime * 1e9))
-            src_size = struct.pack("q", st_src.st_size)
-            fmt = self.cap.fmt.encode() if self.cap.fmt else b"?"
-            if not head.startswith(src_mtime + src_size + fmt):
-                return None
-            with open(cp, "rb") as f:
-                f.seek(64)
-                return f.read()
-        except (OSError, IOError, struct.error):
-            return None
-
-    def _save_cache(self, pdf_bytes):
-        cp = self._cache_path()
-        if cp is None:
+            cap, pdf = _prepare_doc(path)
+            tmp = tempfile.mkdtemp(prefix="cajview_")
+            rd = Renderer(pdf, tmp)
+        except Exception as e:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            messagebox.showerror("打开失败", "无法打开 %s：\n%s"
+                                 % (os.path.basename(path), e),
+                                 parent=self.root)
             return
-        try:
-            st_src = os.stat(self.path)
-            head = (struct.pack("q", int(st_src.st_mtime * 1e9)) +
-                    struct.pack("q", st_src.st_size) +
-                    (self.cap.fmt or "?").encode())
-            tmp = cp + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(head)
-                f.write(pdf_bytes)
-            os.replace(tmp, cp)
-        except (OSError, IOError):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        old_tmp = self.tmp
+        self.path, self.cap, self.pdf = path, cap, pdf
+        self.tmp, self.rd = tmp, rd
+        self.N = cap.page_num or _pdf_page_count(rd.pdf)   # KDH 无头部页数
+        self.cur = 1
+        self.zoom = 1.0
+        self.scroll = 0
+        self._max_scroll = 0
+        self._flip_until = 0.0
+        self._disp = None
+        self._img_id = None
+        self._top_y = 0.0
+        self._photos = []
+        self.text_sel = None
+        self._anno_cancel()
+        self._load_annotations()          # 新文档的标记（sidecar）
+        self.root.title("CAJ 阅读器 - %s" % os.path.basename(path))
+        self.title_lbl.config(text=os.path.basename(path)[:36])
+        self.toc_box.delete(0, tk.END)    # 清空后由 _set_page 重新装载
+        self._set_page(1)
+        self.rd.get_async(1, lambda _n, _obj: None)   # 预热首页
+        shutil.rmtree(old_tmp, ignore_errors=True)    # 清理旧文档临时目录
 
     # ----- 标记持久化：源文件旁 <name>.annotations.json -----
     def _anno_path(self):
@@ -887,9 +1280,11 @@ class Viewer:
     def _build_toolbar(self):
         bar = ttk.Frame(self.root, style="Toolbar.TFrame")
         bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(bar, text=os.path.basename(self.path)[:36],
-                  style="Title.TLabel").pack(side=tk.LEFT, padx=(12, 6), pady=4)
+        self.title_lbl = ttk.Label(bar, text=os.path.basename(self.path)[:36],
+                                    style="Title.TLabel")
+        self.title_lbl.pack(side=tk.LEFT, padx=(12, 6), pady=4)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+        ttk.Button(bar, text="打开", command=self.open_file).pack(side=tk.LEFT, padx=2, pady=3)
         for txt, cmd in (("首页", self.first), ("上一页", self.prev),
                          ("下一页", self.next), ("末页", self.last)):
             ttk.Button(bar, text=txt, command=cmd).pack(side=tk.LEFT, padx=2, pady=3)
@@ -943,8 +1338,11 @@ class Viewer:
     def _build_canvas(self):
         cont = ttk.Frame(self.root, style="Side.TFrame")
         cont.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(cont, bg=PAL["desk"], highlightthickness=0, borderwidth=0)
+        self.canvas = tk.Canvas(cont, bg=PAL["desk"], highlightthickness=0,
+                                borderwidth=0, takefocus=True)  # 页面可拖选文字
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self._ibeam = "ibeam" if _try_cursor(self.canvas, "ibeam") else \
+            ("xterm" if _try_cursor(self.canvas, "xterm") else "")
         self.photo = None
         self.img_ref = None
 
@@ -1001,53 +1399,128 @@ class Viewer:
 
     def _draw(self):
         """页面/缩放/尺寸变化时重绘。未缓存则先显示占位并异步渲染，不阻塞。"""
-        img = self.rd.get(self.cur)
-        if img is None:
+        obj = self.rd.get(self.cur)
+        if obj is None:
             self._show_placeholder()
             self.rd.get_async(self.cur, self._on_page_ready)
             return
-        self._paint(img)
+        self._paint_obj(obj)
         self._prefetch(self.cur)
 
-    def _paint(self, img):
-        sc = self._display_scale(img.width)
-        dw = max(1, int(img.width * sc))
-        dh = max(1, int(img.height * sc))
+    def _paint_obj(self, obj):
+        """obj 为 PageLayout（文本页）或 PIL Image（位图页）。"""
+        if isinstance(obj, PageLayout):
+            self._paint_layout(obj)
+        else:
+            self._paint(obj)
+
+    def _page_geom(self, page_w, page_h):
+        """按“宽度适配 + zoom”计算显示尺寸与滚动几何。"""
+        sc = self._display_scale(page_w)
+        dw = max(1, int(page_w * sc))
+        dh = max(1, int(page_h * sc))
         cw = max(self.canvas.winfo_width(), 50)
         ch = max(self.canvas.winfo_height(), 50)
         ch_eff = ch - self._foot_h                       # 扣除页脚后的可视高度
         self._max_scroll = max(0, dh - ch_eff)           # 纵向可滚动量
         self.scroll = max(0, min(self.scroll, self._max_scroll))
+        top_y = (ch_eff - dh) / 2 if dh <= ch_eff else -self.scroll
+        return sc, dw, dh, cw, ch, ch_eff, top_y
+
+    def _draw_card(self, cw, dw, dh, top_y):
+        """纸卡（阴影 + 卡面）。页内会随滚动平移的项统一打 page 标签。"""
+        pad = 10                                    # 纸卡内衬边距
+        cx = cw / 2
+        # 阴影（两层，营造纸卡浮于桌面）
+        _rr(self.canvas, cx - dw / 2 - pad + 3, top_y - pad + 4,
+            cx + dw / 2 + pad + 3, top_y + dh + pad + 4, 8,
+            fill=PAL["paper_shadow"], outline="", tags=("page",))
+        _rr(self.canvas, cx - dw / 2 - pad + 5, top_y - pad + 6,
+            cx + dw / 2 + pad + 5, top_y + dh + pad + 6, 8,
+            fill=PAL["paper_shadow"], outline="", tags=("page",))
+        # 纸卡
+        _rr(self.canvas, cx - dw / 2 - pad, top_y - pad,
+            cx + dw / 2 + pad, top_y + dh + pad, 8,
+            fill=PAL["page_bg"], outline=PAL["paper_shadow"], tags=("page",))
+
+    def _paint(self, img):
+        """位图页（扫描件/插图页）：pdftoppm 位图贴图。"""
+        sc, dw, dh, cw, ch, ch_eff, top_y = self._page_geom(img.width, img.height)
         small = img.resize((dw, dh), Image.LANCZOS)
         marks = [a for a in self.annos if a.page == self.cur]
         if marks:                                   # 当前页有标记：合成高亮层
             small = overlay_marks(small, marks)
         self.photo = ImageTk.PhotoImage(small)
         self.canvas.delete("all")
-        pad = 10                                    # 纸卡内衬边距
-        cx = cw / 2
-        top_y = (ch_eff - dh) / 2 if dh <= ch_eff else -self.scroll
-        # 阴影（两层，营造纸卡浮于桌面）
-        sh1 = _rr(self.canvas, cx - dw / 2 - pad + 3, top_y - pad + 4,
-                  cx + dw / 2 + pad + 3, top_y + dh + pad + 4, 8,
-                  fill=PAL["paper_shadow"], outline="")
-        sh2 = _rr(self.canvas, cx - dw / 2 - pad + 5, top_y - pad + 6,
-                  cx + dw / 2 + pad + 5, top_y + dh + pad + 6, 8,
-                  fill=PAL["paper_shadow"], outline="")
-        # 纸卡
-        paper = _rr(self.canvas, cx - dw / 2 - pad, top_y - pad,
-                    cx + dw / 2 + pad, top_y + dh + pad, 8,
-                    fill=PAL["page_bg"], outline=PAL["paper_shadow"])
+        self._draw_card(cw, dw, dh, top_y)
         # 页面图像
-        img_id = self.canvas.create_image(cx, top_y, anchor="n", image=self.photo)
-        self._card_ids = [sh1, sh2, paper, img_id]
-        self._img_id = img_id
+        self._img_id = self.canvas.create_image(cw / 2, top_y, anchor="n",
+                                                image=self.photo, tags=("page",))
+        self._photos = []
         self._disp = (dw, dh)
+        self._top_y = top_y
+        self._draw_footer(cw, ch)
+
+    def _paint_layout(self, lay):
+        """文本页：按版面逐段绘制真实文本项与插图，非位图贴图。
+        缩放/放大重绘时字体按新尺寸重建，任意倍率下都清晰。"""
+        sc, dw, dh, cw, ch, ch_eff, top_y = self._page_geom(lay.w, lay.h)
+        self.canvas.delete("all")
+        self._draw_card(cw, dw, dh, top_y)
+        left = cw / 2 - dw / 2
+        # 高亮标记：矩形画在文字下层（stipple 网点近似半透明，不遮字）
+        for a in [a for a in self.annos if a.page == self.cur]:
+            x0, y0, x1, y1 = a.rect
+            self.canvas.create_rectangle(left + x0 * dw, top_y + y0 * dh,
+                                         left + x1 * dw, top_y + y1 * dh,
+                                         fill=a.color, stipple="gray50",
+                                         outline=a.color, tags=("page",))
+        # 文本选区：按行画淡蓝底，横向边界精确到字符切片
+        # （同样在文字下层；随 page 标签滚动平移）
+        if self.text_sel and self.text_sel[0] == self.cur:
+            for ln in self._sel_spans(lay):
+                rx0 = rx1 = ry0 = ry1 = None
+                for tr, i0, i1 in ln:
+                    size_pt, fam, _ = lay.fonts.get(tr.font, (12, "", "#000000"))
+                    ft = _layout_font(fam, size_pt, sc, tr.bold, tr.italic)
+                    offs = _char_offsets(tr.text, ft)
+                    a = tr.x * sc + offs[i0]
+                    b = tr.x * sc + offs[i1]
+                    y0s, y1s = tr.y * sc, (tr.y + tr.h) * sc
+                    rx0 = a if rx0 is None else min(rx0, a)
+                    rx1 = b if rx1 is None else max(rx1, b)
+                    ry0 = y0s if ry0 is None else min(ry0, y0s)
+                    ry1 = y1s if ry1 is None else max(ry1, y1s)
+                self.canvas.create_rectangle(left + rx0, top_y + ry0,
+                                             left + rx1, top_y + ry1,
+                                             fill=SEL_FILL, outline="", tags=("page",))
+        # 插图
+        self._photos = []
+        for ir in lay.imgs:
+            try:
+                iw = max(1, int(ir.w * sc))
+                ih = max(1, int(ir.h * sc))
+                ph = ImageTk.PhotoImage(ir.img.resize((iw, ih), Image.LANCZOS))
+                self._photos.append(ph)             # 保引用防 GC
+                self.canvas.create_image(left + ir.x * sc, top_y + ir.y * sc,
+                                         anchor="nw", image=ph, tags=("page",))
+            except Exception:
+                pass
+        # 文字：锚点取各段纵向中点，单行多段（中英文混排拆段）也能对齐
+        for tr in lay.texts:
+            size_pt, fam, color = lay.fonts.get(tr.font, (12, "", "#000000"))
+            ft = _layout_font(fam, size_pt, sc, tr.bold, tr.italic)
+            self.canvas.create_text(left + tr.x * sc, top_y + (tr.y + tr.h / 2) * sc,
+                                    anchor="w", text=tr.text, fill=color, font=ft,
+                                    tags=("page",))
+        self._img_id = None
+        self._disp = (dw, dh)
+        self._top_y = top_y
         self._draw_footer(cw, ch)
 
     def _move_page(self):
-        """页内滚动：仅平移页卡（阴影/纸/图像），不重新缩放，保证流畅。"""
-        if not self._card_ids or self._disp is None:
+        """页内滚动：按 page 标签整体平移页卡（含文本项），不重新缩放。"""
+        if self._disp is None:
             return
         dw, dh = self._disp
         cw = max(self.canvas.winfo_width(), 50)
@@ -1056,13 +1529,10 @@ class Viewer:
         self._max_scroll = max(0, dh - ch_eff)
         self.scroll = max(0, min(self.scroll, self._max_scroll))
         top_y = (ch_eff - dh) / 2 if dh <= ch_eff else -self.scroll
-        pad = 10
-        cx = cw / 2
-        # 阴影1 / 阴影2 / 纸卡 / 图像
-        self.canvas.moveto(self._card_ids[0], cx - dw / 2 - pad + 3, top_y - pad + 4)
-        self.canvas.moveto(self._card_ids[1], cx - dw / 2 - pad + 5, top_y - pad + 6)
-        self.canvas.moveto(self._card_ids[2], cx - dw / 2 - pad, top_y - pad)
-        self.canvas.moveto(self._card_ids[3], cx - dw / 2, top_y)
+        dy = top_y - self._top_y
+        if dy:
+            self.canvas.move("page", 0, dy)
+            self._top_y = top_y
 
     def _draw_footer(self, cw, ch):
         """签名元素：底部黄铜“页垛”阅读进度条。"""
@@ -1085,7 +1555,7 @@ class Viewer:
         ch = max(self.canvas.winfo_height(), 50)
         self._disp = None
         self._img_id = None
-        self._card_ids = []
+        self._photos = []
         self.canvas.delete("all")
         pw, ph = 420, 150
         cx, cy = cw / 2, ch / 2
@@ -1102,22 +1572,22 @@ class Viewer:
                                 fill=PAL["brass"], width=2)
         self._draw_footer(cw, ch)
 
-    def _on_page_ready(self, n, img):
-        if img is None or n != self.cur:
+    def _on_page_ready(self, n, obj):
+        if obj is None or n != self.cur:
             return
         try:
             if not self.root.winfo_exists():
                 return
         except tk.TclError:
             return
-        self._paint(img)
+        self._paint_obj(obj)
         self._prefetch(n)
 
     def _prefetch(self, n):
         """后台预取相邻页，使连续翻页几乎即时。"""
         for m in (n - 1, n + 1):
             if 1 <= m <= self.N and self.rd.get(m) is None:
-                self.rd.get_async(m, lambda _n, _img: None)
+                self.rd.get_async(m, lambda _n, _obj: None)
 
     def _poll_render(self):
         """定期取回后台渲染结果（主线程）。"""
@@ -1127,9 +1597,9 @@ class Viewer:
         except tk.TclError:
             return
         try:
-            for cb, n, img in self.rd.drain():
+            for cb, n, obj in self.rd.drain():
                 try:
-                    cb(n, img)
+                    cb(n, obj)
                 except Exception:
                     pass
         except Exception:
@@ -1189,12 +1659,12 @@ class Viewer:
 
     # ----- 内容标记交互 -----
     def _toggle_mark_mode(self):
-        """标记模式开关：开启为十字光标拖选；关闭恢复默认。"""
+        """标记模式开关：开启为十字光标拖选；关闭为 I 型光标（可拖选文字）。"""
         self._anno_cancel()
         if self.mark_on.get():
             self.canvas.config(cursor="crosshair")
         else:
-            self.canvas.config(cursor="")
+            self.canvas.config(cursor=self._ibeam or "")
 
     def _set_mark_color(self, hexv):
         self.mark_color.set(hexv)
@@ -1232,55 +1702,210 @@ class Viewer:
         return None
 
     def _anno_press(self, ev):
-        if not self.mark_on.get() or self._disp is None:
-            self._anno_sel = None
+        if self.mark_on.get():                 # 标记模式：拖画高亮
+            if self._disp is None:
+                self._anno_sel = None
+                return
+            self._selpress = None
+            self._anno_sel = [(ev.x, ev.y), None]
             return
-        self._anno_sel = [(ev.x, ev.y), None]
+        # 普通模式：拖选文字（点一下空白处=清除选区，见 _anno_release）
+        self._anno_sel = None
+        self._selpress = (ev.x, ev.y) if self._disp is not None else None
 
     def _anno_drag(self, ev):
-        if not self._anno_sel:
+        if self.mark_on.get():
+            if not self._anno_sel:
+                return
+            (sx, sy), _ = self._anno_sel
+            self.canvas.delete("anno_preview")
+            pid = self.canvas.create_rectangle(sx, sy, ev.x, ev.y,
+                                               outline=self.mark_color.get(),
+                                               width=2, dash=(4, 3),
+                                               tags="anno_preview")
+            self._anno_sel[1] = pid
             return
-        (sx, sy), _ = self._anno_sel
-        self.canvas.delete("anno_preview")
-        pid = self.canvas.create_rectangle(sx, sy, ev.x, ev.y,
-                                           outline=self.mark_color.get(),
-                                           width=2, dash=(4, 3),
-                                           tags="anno_preview")
-        self._anno_sel[1] = pid
+        if self._selpress:                     # 文字选区拖选预览
+            sx, sy = self._selpress
+            self.canvas.delete("sel_preview")
+            self.canvas.create_rectangle(sx, sy, ev.x, ev.y,
+                                         outline=PAL["brass"], width=1,
+                                         dash=(3, 3), tags="sel_preview")
 
     def _anno_release(self, ev):
-        if not self._anno_sel:
+        if self.mark_on.get():
+            if not self._anno_sel:
+                return
+            (sx, sy), _ = self._anno_sel
+            self._anno_sel = None
+            self.canvas.delete("anno_preview")
+            if self._disp is None:
+                return
+            # 位移过小视为点击：命中已有标记则弹出换色/删除菜单
+            if abs(ev.x - sx) < 6 and abs(ev.y - sy) < 6:
+                hit = self._anno_at(ev.x, ev.y)
+                if hit:
+                    self._anno_menu(hit, ev.x_root, ev.y_root)
+                return
+            x0, y0 = self._norm_from_canvas(sx, sy)
+            x1, y1 = self._norm_from_canvas(ev.x, ev.y)
+            nx0, nx1 = min(x0, x1), max(x0, x1)
+            ny0, ny1 = min(y0, y1), max(y0, y1)
+            if (nx1 - nx0) * (ny1 - ny0) < 0.0005:      # 过滤误触
+                return
+            a = Annotation(page=self.cur, rect=[nx0, ny0, nx1, ny1],
+                           color=self.mark_color.get())
+            self.annos.append(a)
+            self._save_annotations()
+            self._draw()
             return
-        (sx, sy), _ = self._anno_sel
-        self._anno_sel = None
-        self.canvas.delete("anno_preview")
+        # 普通模式：落定文字选区
+        if self._selpress is None:
+            return
+        sx, sy = self._selpress
+        self._selpress = None
+        self.canvas.delete("sel_preview")
         if self._disp is None:
             return
-        # 位移过小视为点击：命中已有标记则弹出换色/删除菜单
-        if abs(ev.x - sx) < 6 and abs(ev.y - sy) < 6:
-            hit = self._anno_at(ev.x, ev.y)
-            if hit:
-                self._anno_menu(hit, ev.x_root, ev.y_root)
+        if abs(ev.x - sx) < 5 and abs(ev.y - sy) < 5:   # 单击：清除选区
+            self._clear_selection()
+            return
+        if not isinstance(self.rd.get(self.cur), PageLayout):
+            self._toast("此页为扫描图像，无可选文字")
             return
         x0, y0 = self._norm_from_canvas(sx, sy)
         x1, y1 = self._norm_from_canvas(ev.x, ev.y)
-        nx0, nx1 = min(x0, x1), max(x0, x1)
-        ny0, ny1 = min(y0, y1), max(y0, y1)
-        if (nx1 - nx0) * (ny1 - ny0) < 0.0005:      # 过滤误触
-            return
-        a = Annotation(page=self.cur, rect=[nx0, ny0, nx1, ny1],
-                       color=self.mark_color.get())
-        self.annos.append(a)
-        self._save_annotations()
+        self.text_sel = (self.cur, min(x0, x1), min(y0, y1),
+                         max(x0, x1), max(y0, y1))
         self._draw()
 
     def _anno_cancel(self):
         """取消进行中的拖选预览（翻页/关闭模式时）。"""
         self._anno_sel = None
+        self._selpress = None
         try:
             self.canvas.delete("anno_preview")
+            self.canvas.delete("sel_preview")
         except tk.TclError:
             pass
+
+    # ----- 文本选区与复制 -----
+    def _sel_spans(self, lay):
+        """选区覆盖的字符片段 -> 按阅读顺序分行的 [[(TextRun, i0, i1)]]。
+        i0/i1 为 TextRun 内的字符切片下标：纵向要求段中线落在选区带内
+        （或盖过半高），横向用 tk 字体逐字测量把选区边界映射到字符级，
+        矩形拖选精确到单个字。"""
+        if not self.text_sel or self.text_sel[0] != self.cur:
+            return []
+        _, nx0, ny0, nx1, ny1 = self.text_sel
+        sc = self._display_scale(lay.w)
+        x0, x1 = nx0 * lay.w * sc, nx1 * lay.w * sc
+        y0, y1 = ny0 * lay.h * sc, ny1 * lay.h * sc
+        spans = []
+        for tr in lay.texts:
+            ty0, ty1 = tr.y * sc, (tr.y + tr.h) * sc
+            if not (y0 <= ty0 + tr.h * sc / 2 <= y1
+                    or min(y1, ty1) - max(y0, ty0) >= 0.5 * tr.h * sc):
+                continue
+            size_pt, fam, _ = lay.fonts.get(tr.font, (12, "", "#000000"))
+            ft = _layout_font(fam, size_pt, sc, tr.bold, tr.italic)
+            offs = _char_offsets(tr.text, ft)
+            i0 = i1 = None
+            for i in range(len(tr.text)):
+                cx = tr.x * sc + (offs[i] + offs[i + 1]) / 2
+                if x0 <= cx <= x1:
+                    if i0 is None:
+                        i0 = i
+                    i1 = i + 1
+            if i0 is not None:
+                spans.append((tr, i0, i1))
+        spans.sort(key=lambda s: (s[0].y, s[0].x))
+        lines, cur = [], None
+        for s in spans:
+            tr = s[0]
+            if (cur and abs((tr.y + tr.h / 2) - (cur[0][0].y + cur[0][0].h / 2))
+                    <= 0.5 * max(tr.h, cur[0][0].h)):
+                cur.append(s)
+            else:
+                cur = [s]
+                lines.append(cur)
+        for ln in lines:
+            ln.sort(key=lambda s: s[0].x)
+        return lines
+
+    def _sel_text(self):
+        """选中文本 -> 字符串（切片拼接；段间隙明显大于字距时补空格，
+        CJK 段内伪迹空格收紧，行间换行）。"""
+        obj = self.rd.get(self.cur)
+        if not isinstance(obj, PageLayout) or not self.text_sel:
+            return ""
+        parts = []
+        for ln in self._sel_spans(obj):
+            buf, prev = "", None
+            for tr, i0, i1 in ln:
+                if prev is not None:
+                    ptr, pi0, pi1 = prev
+                    if pi1 >= len(ptr.text) and i0 == 0:
+                        gap = tr.x - (ptr.x + ptr.w)
+                        size = obj.fonts.get(tr.font, (12,))[0] or 12
+                        if (gap > 0.6 * size and not buf.endswith(" ")
+                                and not tr.text.startswith(" ")):
+                            buf += " "
+                buf += _cjk_tight(tr.text[i0:i1])
+                prev = (tr, i0, i1)
+            buf = buf.strip()
+            if buf:
+                parts.append(buf)
+        return "\n".join(parts)
+
+    def _copy_selection(self, ev=None):
+        txt = self._sel_text()
+        if not txt:
+            self._toast("未选中文本")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self._toast("已复制 %d 字" % len(txt.replace("\n", "")))
+
+    def _clear_selection(self):
+        if self.text_sel:
+            self.text_sel = None
+            self._draw()
+
+    def _sel_menu(self, ev):
+        """右键：有选区时弹复制/清除菜单。"""
+        if not self.text_sel or self.text_sel[0] != self.cur or not self._sel_text():
+            return
+        m = tk.Menu(self.canvas, tearoff=0, bg=PAL["panel"], fg=PAL["paper"],
+                    activebackground=PAL["brass"], activeforeground=PAL["ink"])
+        m.add_command(label="复制选中文本（Ctrl+C）", command=self._copy_selection)
+        m.add_command(label="清除选区（Esc）", command=self._clear_selection)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def _toast(self, msg):
+        """画布顶部轻提示（1.8 秒自动消失，不打断阅读）。"""
+        try:
+            self.canvas.delete("toast")
+        except tk.TclError:
+            pass
+        cw = max(self.canvas.winfo_width(), 50)
+        tid = _rr(self.canvas, cw / 2 - 90, 12, cw / 2 + 90, 40, 8,
+                  fill=PAL["panel"], outline=PAL["brass_dim"], tags=("toast",))
+        self.canvas.create_text(cw / 2, 26, text=msg, fill=PAL["paper"],
+                                font=_font("ui", 10), tags=("toast",))
+        self._toast_tok += 1
+        tok = self._toast_tok
+        def _rm():
+            if self._toast_tok == tok:
+                try:
+                    self.canvas.delete("toast")
+                except tk.TclError:
+                    pass
+        self.root.after(1800, _rm)
+        return tid
 
     def _anno_menu(self, anno, x, y):
         """点击已有标记：弹出换色（四色）+ 删除菜单。"""
@@ -1357,6 +1982,11 @@ def analyze_text(cap):
         L.append("CAJViewer 专有 JBig 编码图像（无法直接解码），少量为")
         L.append("标准 JPEG。本程序解析页信息表，将 JPEG 页直接嵌入")
         L.append("PDF，JBig 页以占位白纸代替（可正常翻页/大纲跳转）。")
+    elif cap.fmt == "KDH":
+        L.append("KDH 2.00 为新版知网下载的加密格式：头部 0x3C 处指向")
+        L.append("尾部明文 XML 元数据，其间为多字节循环 XOR 加密的 PDF。")
+        L.append("本程序按字节频率分析自动恢复密钥并解出内嵌 PDF，")
+        L.append("同一文件第二次打开走 sidecar 缓存，近瞬时。")
     else:
         L.append("此格式变体暂不完整支持。")
     L.append("=" * 56)
@@ -1364,11 +1994,23 @@ def analyze_text(cap):
 
 def main():
     if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-    path = sys.argv[1]
-    if not os.path.exists(path):
-        sys.exit("文件不存在: %s" % path)
+        # 无参数启动（应用菜单/桌面图标）：弹出文件选择对话框。
+        # 无 GUI 环境（缺 tkinter/无显示器）则退回打印用法。
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            path = filedialog.askopenfilename(title="打开文档",
+                                              filetypes=OPEN_FILETYPES)
+            root.destroy()
+        except Exception:
+            print(__doc__)
+            sys.exit(1)
+        if not path:                        # 用户取消：静默退出
+            return
+    else:
+        path = sys.argv[1]
+        if not os.path.exists(path):
+            sys.exit("文件不存在: %s" % path)
     cap = CAJParser(path)
     if cap.fmt is None:
         sys.exit("无法识别的文件类型（未知魔数）。")

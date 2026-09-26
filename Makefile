@@ -1,12 +1,12 @@
 # CAJ 阅读器 —— .deb 一键打包
 # 用法：
 #   make            等价于 make deb
-#   make deb        生成 caj-viewer_1.0.0_all.deb
+#   make deb        生成 caj-viewer_$(VERSION)_all.deb
 #   make clean      清理构建产物
 #   make install    编译后直接用 dpkg 安装（需要 sudo）
 
 PKG      := caj-viewer
-VERSION  := 1.0.0
+VERSION  := 1.0.1
 ARCH     := all
 DEB_FILE := $(PKG)_$(VERSION)_$(ARCH).deb
 PKG_DIR  := packaging
@@ -80,6 +80,7 @@ uninstall:
 
 clean:
 	rm -rf $(BUILD)
+	rm -rf $(PKG_DIR)/usr/share/caj-viewer/__pycache__
 	rm -f $(PKG_DIR)/usr/share/caj-viewer/caj_viewer.py
 	rm -f $(PKG_DIR)/usr/share/caj-viewer/appicon.png
 	rm -f $(PKG_DIR)/usr/share/doc/caj-viewer/README
