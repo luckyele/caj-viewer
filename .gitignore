@@ -4,3 +4,5 @@ __pycache__/
 libjbigdec.so
 packaging/
 .trae/
+.sysroot/
+compile_commands.json

@@ -3,6 +3,7 @@
 // _kdh_decrypt / _prepare_doc / analyze_text / Renderer 等非 GUI 部分。
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -109,6 +110,8 @@ public:
     std::vector<std::tuple<PageCallback, int, PagePtr>> drain();
 
 private:
+    void lru_touch(int n);              // 需持锁调用
+    void store(int n, PagePtr p);       // 写入 LRU 缓存
     PagePtr render(int n);
     std::shared_ptr<const PageLayout> render_layout(int n);
     std::shared_ptr<const Bitmap> render_bitmap(int n);
@@ -123,6 +126,10 @@ private:
     std::vector<int> lru_;
     std::map<int, std::vector<PageCallback>> inflight_;
     std::vector<std::tuple<PageCallback, int, PagePtr>> done_;
+    // 后台渲染线程计数：析构前等待归零，避免线程继续访问已析构的成员
+    int running_ = 0;
+    std::condition_variable cv_;
+    bool closing_ = false;
     size_t max_ = 10;
     int dpi_ = 120;
 };
