@@ -21,6 +21,7 @@
 | [caj_viewer.py](file:///home/lucky/caj-viewer/caj_viewer.py) | 2030 | 行为基准（tkinter） |
 | [CMakeLists.txt](file:///home/lucky/caj-viewer/CMakeLists.txt) | 44 | 构建；`CAJ_SYSROOT` 开关；`-Wall -Wextra` |
 | [bootstrap-deps.sh](file:///home/lucky/caj-viewer/bootstrap-deps.sh) | — | 无 root 拉 GTK3 到 `.sysroot/` |
+| [Makefile](file:///home/lucky/caj-viewer/Makefile) | 134 | 构建入口：`build` / `verify` / `smoke` / `run`（默认目标 = `build`）；`deb` 系列为 Python 参考实现的遗留打包通道 |
 
 ## 3. core 层地图（`caj_core.cpp`）
 
@@ -268,5 +269,5 @@ gtk_init_check(L2358) → 参数解析 → 文件校验(L2362-2374) → analyze_
 | 渲染子进程只有一个入口 | `run_capture` L154 | 别绕过它，否则丢超时保护 |
 | `%PDF-` 既是格式名也是缓存正文定位锚 | `caj_open` L534 / `try_load_cache` L1290 | 改缓存头时注意 |
 | `.py` 与 `.cpp` 同名函数 | 全局 | 搜函数名会双命中，先确认文件 |
-| **README 是 Python/tkinter 视角** | [README.md](file:///home/lucky/caj-viewer/README.md) | 与 C++ 主线不一致，勿据此建立心智模型 |
-| Makefile 是 Python 打包用 | [Makefile](file:///home/lucky/caj-viewer/Makefile) | `deb` target 依赖 `caj_viewer.py`，与 C++ 构建无关 |
+| 老文档里的 Python 视角 | `README.md` / `Makefile` | 已于 2026-09-26 改以 C++ 为主线，但 `caj_viewer.py` 仍是行为基准，描述格式逻辑时仍可能读到 Python 措辞 |
+| `make deb` 是遗留通道 | [Makefile](file:///home/lucky/caj-viewer/Makefile) | `deb` / `install-local` 系列打包的仍是 `caj_viewer.py`，且依赖未入库的 `packaging/`；C++ 主线只走 `make build` |

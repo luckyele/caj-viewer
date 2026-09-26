@@ -13,8 +13,10 @@ CAJ / KDH 文献阅读器。`caj_viewer.py` 是已验证的行为基准，`src/`
   cmake -S . -B build -DCAJ_SYSROOT=$PWD/.sysroot/root && cmake --build build -j
   ```
   系统已装 `libgtk-3-dev` 时可省略 `-DCAJ_SYSROOT`。
+- `make build` 是上面两条的封装（检测到 `.sysroot/root` 时自动带开关）；`make verify` / `make smoke` 即下一节的验证前两条。
 - `-Wall -Wextra` 已开启，**必须保持零警告**。
 - 改完源码如果 `cmake --build` 没有重新编译，先 `touch src/*.cpp` 再构建。
+- `Makefile` 里的 `deb` / `install-local` / `install` 打包的是 **Python 参考实现**（`caj_viewer.py`），且依赖未入库的 `packaging/`，与 C++ 主线无关，不要用它验证 C++ 改动。
 
 ## 验证（每次改动后至少跑前两条）
 
