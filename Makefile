@@ -2,6 +2,7 @@
 #
 #   make            等价于 make build：配置 + 编译，产出 build/caj-viewer
 #   make build      检测到 .sysroot/root 时自动带上 -DCAJ_SYSROOT
+#   make test       编译并跑 ctest（纯几何单元测试，无 GTK 依赖）
 #   make verify     格式回归：对基准样本跑 --info（SAMPLE=... 可换样本）
 #   make smoke      GUI 冒烟：8 秒后自动结束，退出码 124 视为通过
 #   make run        运行（FILE=... 指定文献；不给 FILE 则在界面里弹选择框）
@@ -22,13 +23,16 @@ FILE   ?=
 # 无 root 环境靠本地 sysroot 提供 GTK3 头文件与链接目录
 SYSROOT := $(if $(wildcard .sysroot/root),-DCAJ_SYSROOT=$(CURDIR)/.sysroot/root,)
 
-.PHONY: all build verify smoke run check-sample clean deb install-local install uninstall
+.PHONY: all build test verify smoke run check-sample clean deb install-local install uninstall
 
 all: build
 
 build:
 	cmake -S . -B $(CXX_BUILD) $(SYSROOT)
 	cmake --build $(CXX_BUILD) -j
+
+test: build
+	cd $(CXX_BUILD) && ctest --output-on-failure
 
 # 样本不存在时给出可操作提示，而不是让后续命令报一堆无关错误
 check-sample:

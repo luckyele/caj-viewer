@@ -95,7 +95,7 @@
 | `prefetch` | L1532–1539 | 预取相邻页（`draw` 末尾调用） |
 | `request_page` | L1541–1548 | 经 `pending_page` 去重后投递异步渲染 |
 | `on_page_ready` | L1550–1555 | 渲染完成回调 → `queue_draw` |
-| `poll_render_cb` | L2145–2155 | 60ms 定时器，`rd->drain()` 取回结果（**空文档阶段也保持轮询**） |
+| `drain_render_cb` | L2283–2293 | 由渲染线程经 `g_main_context_invoke` 投递的一次性回调（`G_SOURCE_REMOVE`）：`rd->drain()` 取回结果。**已取代旧的 60ms `poll_render_cb` 轮询** |
 
 ### 4.4 文档打开与持久化
 
@@ -127,7 +127,7 @@
 | `on_key_cb` | L2060–2102 | 快捷键 switch |
 | `on_toc_row` / `on_toc_toggle` / `on_mark_toggle` / `on_mark_color` | L2104–2143 | 控件回调 |
 | `open_initial_cb` / `choose_file_cb` / `on_destroy_cb` | L2158 / L2165 / L2171 | 启动与退出 |
-| **`build_ui`** | L2181–2337 | **全部控件在这里创建**：CSS sheet（L2183–2205）→ 工具栏（L2224–2298）→ 目录侧栏（L2300–2317）→ 画布 + 事件注册（L2319–2333）→ 轮询定时器（L2336） |
+| **`build_ui`** | L2314–2466 | **全部控件在这里创建**：CSS sheet → 工具栏 → 目录侧栏 → 画布 + 事件注册。**末尾不再建轮询定时器**（唤醒由 `Renderer::set_wakeup` 钩子投递 `drain_render_cb`） |
 | **`main`** | L2346–2404 | 启动序列（详见 §5.J） |
 
 ## 5. 改动接缝（改之前先看这里）
@@ -201,7 +201,7 @@
 两个独立于 `psurf` 的缓存：
 
 - `bmp_cache`（L643 / `bitmap_cached` L981）key 是 `Bitmap*` **指针**；靠 `bmp_holder`（L644）持有当前页，防止 `Bitmap` 被回收后地址复用导致串图。加新的位图来源时**必须同样持有**。
-- `Renderer` 内部 LRU（`cache_`，容量 `max_ = 10`、`dpi_ = 120`）。`rd->get()` **只读缓存、绝不触发同步渲染**（hpp L103）。要新内容就走 `get_async` + `drain`。
+- `Renderer` 内部 LRU（`cache_`，容量 `max_ = 24`、`dpi_ = 120`）。`rd->get()` **只读缓存、绝不触发同步渲染**（hpp L103）。要新内容就走 `get_async` + `drain`。
 
 ### H. 加一种鼠标交互（手势）
 
@@ -252,8 +252,8 @@ gtk_init_check(L2358) → 参数解析 → 文件校验(L2362-2374) → analyze_
           ├─ load_annotations / add_recent
           ├─ set_page(1) → request_page
           └─ rm_rf 旧临时目录
-              ↓ 60ms 轮询
-      poll_render_cb (L2145) → rd->drain() → on_page_ready (L1550) → queue_draw
+              ↓ 渲染线程完成后 set_wakeup → g_main_context_invoke
+      drain_render_cb (L2283) → rd->drain() → on_page_ready (L1550) → queue_draw
               ↓
       on_draw_cb (L1911) → App::draw (L1327) → page_surface (L1115, 含 rev) → compose (L995)
 ```

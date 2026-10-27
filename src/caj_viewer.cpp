@@ -8,6 +8,8 @@
 //      标记/选区/尺寸/页面变化时重建该表面。
 //   2. 高亮用 cairo 半透明 rgba 填充+描边（Python 位图页为 rgba(…,70) 合成、
 //      文本页为 gray50 网点），视觉一致。
+//   3. 插图按 pdftohtml 的 width/height 正负处理镜像；PDF image mask（stencil）
+//      以墨色掩膜绘制。Python 版会把掩膜当普通位图贴（黑底白字），且负宽高被丢弃。
 #include <gtk/gtk.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "caj_core.hpp"
+#include "sel_brush.hpp"
 
 namespace {
 
@@ -399,6 +402,26 @@ cairo_surface_t* bitmap_surface(const caj::Bitmap& b) {
     return s;
 }
 
+// 图像掩膜（PDF 的 image mask，pdftohtml 输出为“白=着色区”的 1 位灰度图）
+// -> A8 表面：亮度即 alpha，配合墨色绘制即得原始观感
+cairo_surface_t* mask_surface(const caj::Bitmap& b) {
+    if (b.w <= 0 || b.h <= 0) return nullptr;
+    cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_A8, b.w, b.h);
+    if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(s);
+        return nullptr;
+    }
+    unsigned char* d = cairo_image_surface_get_data(s);
+    int stride = cairo_image_surface_get_stride(s);
+    for (int y = 0; y < b.h; y++) {
+        const unsigned char* src = &b.rgb[(size_t)y * b.w * 3];
+        unsigned char* dst = d + (size_t)y * stride;
+        for (int x = 0; x < b.w; x++) dst[x] = src[x * 3];   // 灰度图，取 R 通道
+    }
+    cairo_surface_mark_dirty(s);
+    return s;
+}
+
 // ================= 极简 JSON（标注文件读写） =================
 struct JVal {
     enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
@@ -608,6 +631,10 @@ struct App {
     double flip_until = 0;        // 翻页后的落位保护截止（单调时钟秒）
     double smooth_acc = 0;
 
+    // 页面旋转（视图级，仅本次会话）。旋转角 = rot_all + rot_page[页]，取模 360。
+    int rot_all = 0;              // 全部页面附加旋转，0/90/180/270
+    std::map<int, int> rot_page;  // 单页附加旋转，叠加在 rot_all 之上
+
     // 标记
     std::vector<Annotation> annos;
     bool mark_on = false;
@@ -622,6 +649,14 @@ struct App {
     bool has_sel = false;
     int sel_page = 0;
     double sel[4] = {0, 0, 0, 0};
+    // 笔刷式选择（b 键切换；与矩形共用 selpress 拖选流）
+    bool brush_mode = false;      // true=笔刷，false=矩形
+    double brush_r = 8.0;         // 笔刷半径（显示像素，[ ] 调整）
+    std::vector<brush::Point> brush_pts;  // 拖选中的笔画（画布坐标）
+    // 落定的笔刷选区：路径为归一化页面坐标，半径按页宽比存储（缩放不变）
+    bool sel_is_brush = false;
+    double sel_r = 0;             // 半径 / 页宽
+    std::vector<brush::Point> sel_path;
 
     std::string toast;
     int toast_tok = 0;
@@ -633,7 +668,7 @@ struct App {
 
     // 当前页缓存表面
     cairo_surface_t* psurf = nullptr;
-    int ps_page = -1, ps_dw = 0, ps_dh = 0, ps_rev = -1;
+    int ps_page = -1, ps_dw = 0, ps_dh = 0, ps_rev = -1, ps_rot = -1;
     caj::PagePtr ps_obj;
 
     // 缩放预览：连续缩放时先拉伸旧表面顶替，停手后再整页重排
@@ -656,7 +691,6 @@ struct App {
     GtkWidget* toc_sw = nullptr;
     GtkWidget* mark_btn = nullptr;
     GtkCssProvider* mark_css = nullptr;
-    guint poll_id = 0;
 
     // 方法
     void queue_draw() { gtk_widget_queue_draw(canvas); }
@@ -687,8 +721,34 @@ struct App {
     void draw_placeholder(cairo_t* cr, int cw, int ch);
     void draw_welcome(cairo_t* cr, int cw, int ch);
     cairo_surface_t* bitmap_cached(const caj::PagePtr& pg, const caj::Bitmap& b);
-    cairo_surface_t* compose(const caj::PagePtr& pg, int dw, int dh, double sc);
-    cairo_surface_t* page_surface(const caj::PagePtr& obj, int dw, int dh, double sc);
+    cairo_surface_t* compose(const caj::PagePtr& pg, int uw, int uh, double sc);
+    cairo_surface_t* page_surface(const caj::PagePtr& obj, int dw, int dh, double sc,
+                                  int rot);
+    // 页面旋转：本页的最终旋转角 = rot_all + rot_page[页]（取模 360）
+    int eff_rot(int n) const {
+        auto it = rot_page.find(n);
+        return ((rot_all + (it == rot_page.end() ? 0 : it->second)) % 360 + 360) % 360;
+    }
+    bool rot_swapped(int n) const { int r = eff_rot(n); return r == 90 || r == 270; }
+    void rotate_page() {                 // 顺时针 90°，仅当前页
+        if (!rd || N <= 0) { toast_msg("请先打开文档"); return; }
+        int r = (eff_rot(cur) + 90) % 360;
+        rot_page[cur] = ((r - rot_all) % 360 + 360) % 360;
+        bump_rev();
+        queue_draw();
+        char b[64];
+        snprintf(b, sizeof(b), "第 %d 页旋转 %d°", cur, r);
+        toast_msg(b);
+    }
+    void rotate_all_pages() {            // 顺时针 90°，全部页面
+        if (!rd || N <= 0) { toast_msg("请先打开文档"); return; }
+        rot_all = (rot_all + 90) % 360;
+        bump_rev();
+        queue_draw();
+        char b[64];
+        snprintf(b, sizeof(b), "全部页面旋转 %d°", rot_all);
+        toast_msg(b);
+    }
     double display_scale(double img_w, int cw) const {
         return (std::max(cw, 50) / img_w) * zoom;
     }
@@ -727,6 +787,8 @@ struct App {
     void copy_selection();
     void clear_selection();
     void sel_menu(double x, double y);
+    void toggle_brush();
+    void brush_adjust(double d);
     // 几何
     void page_rect(double cw, double ch, double* left, double* top_y) const;
     void norm_from_canvas(double cw, double ch, double x, double y, double* nx,
@@ -934,8 +996,14 @@ void App::norm_from_canvas(double cw, double ch, double x, double y, double* nx,
                            double* ny) const {
     double left, top_y;
     page_rect(cw, ch, &left, &top_y);
-    *nx = cur_dw ? (x - left) / cur_dw : 0.0;
-    *ny = cur_dh ? (y - top_y) / cur_dh : 0.0;
+    double u = cur_dw ? (x - left) / cur_dw : 0.0;   // 旋转后画面空间归一化
+    double v = cur_dh ? (y - top_y) / cur_dh : 0.0;
+    // 逆旋转：映射回未旋转的页面空间（标注/选区始终存该空间的归一化坐标）
+    int rot = eff_rot(cur);
+    if (rot == 90) { *nx = v; *ny = 1.0 - u; }
+    else if (rot == 180) { *nx = 1.0 - u; *ny = 1.0 - v; }
+    else if (rot == 270) { *nx = 1.0 - v; *ny = u; }
+    else { *nx = u; *ny = v; }
     *nx = std::max(0.0, std::min(1.0, *nx));
     *ny = std::max(0.0, std::min(1.0, *ny));
 }
@@ -946,6 +1014,18 @@ struct RunGeom {
     std::vector<size_t> bounds;    // 字符边界字节下标（n+1 项）
     std::vector<double> xs0, xs1;  // 每字符 x 区间（缩放后页面坐标）
 };
+
+// 本机字体与 PDF 内嵌子集字体的度量不一致（如 Noto Serif CJK 每字略窄于
+// 方正宋体），pdftohtml 的 run 宽度是 PDF 里的真实占宽；按自然宽度逐段
+// 绘制时误差在长 run 内逐字累计，与相邻 run 重叠脱节。把字符区间等比
+// 拉伸/压缩到声明宽度（阈值 2.5% 内不动），绘制与选区共用同一映射。
+double run_hfit(const caj::TextRun& tr, double sc, double tw_px) {
+    double target = tr.w * sc;
+    if (tr.w <= 0 || tw_px <= 0) return 1.0;
+    double k = target / tw_px;
+    if (k > 1.0 - 0.025 && k < 1.0 + 0.025) return 1.0;
+    return k;
+}
 
 void run_geom(const caj::TextRun& tr, const caj::FontSpec& fs, double sc,
               RunGeom& g) {
@@ -968,9 +1048,10 @@ void run_geom(const caj::TextRun& tr, const caj::FontSpec& fs, double sc,
     }
     int tw = 0, th = 0;
     pango_layout_get_pixel_size(pl, &tw, &th);
+    double k = run_hfit(tr, sc, (double)tw);
     for (size_t i = 0; i < n; i++) {
-        g.xs0[i] = tr.x * sc + xs[i];
-        g.xs1[i] = tr.x * sc + (i + 1 < n ? xs[i + 1] : (double)tw);
+        g.xs0[i] = tr.x * sc + xs[i] * k;
+        g.xs1[i] = tr.x * sc + (i + 1 < n ? xs[i + 1] : (double)tw) * k;
     }
     g_object_unref(pl);
     cairo_destroy(cr);
@@ -992,8 +1073,40 @@ cairo_surface_t* App::bitmap_cached(const caj::PagePtr& pg, const caj::Bitmap& b
     return cairo_surface_reference(s);   // 返回引用给调用方，调用方照旧 destroy
 }
 
-cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc) {
-    cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, dw, dh);
+// 把整页表面按 90° 整数倍顺时针旋转（仅 90/270 交换宽高）。rot=0 时返回原表面引用。
+cairo_surface_t* rotate_surface(cairo_surface_t* src, int rot) {
+    rot = ((rot % 360) + 360) % 360;
+    if (rot == 0) return cairo_surface_reference(src);
+    int sw = cairo_image_surface_get_width(src);
+    int sh = cairo_image_surface_get_height(src);
+    bool swap = (rot == 90 || rot == 270);
+    int dw = swap ? sh : sw, dh = swap ? sw : sh;
+    cairo_surface_t* dst = cairo_image_surface_create(CAIRO_FORMAT_RGB24, dw, dh);
+    if (cairo_surface_status(dst) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(dst);
+        return nullptr;
+    }
+    cairo_t* cr = cairo_create(dst);
+    // 源(surface) -> 目标(device) 顺时针映射：90:(sh-sy,sx) 180:(sw-sx,sh-sy) 270:(sy,sw-sx)
+    if (rot == 90) {
+        cairo_translate(cr, sh, 0);
+        cairo_rotate(cr, M_PI / 2);
+    } else if (rot == 180) {
+        cairo_translate(cr, sw, sh);
+        cairo_rotate(cr, M_PI);
+    } else {  // 270
+        cairo_translate(cr, 0, sw);
+        cairo_rotate(cr, -M_PI / 2);
+    }
+    cairo_set_source_surface(cr, src, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    return dst;
+}
+
+cairo_surface_t* App::compose(const caj::PagePtr& pg, int uw, int uh, double sc) {
+    cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, uw, uh);
     if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(s);
         return nullptr;
@@ -1012,7 +1125,7 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
         cairo_surface_t* bs = bitmap_cached(pg, *pg->bitmap);
         if (bs) {
             cairo_save(cr);
-            cairo_scale(cr, (double)dw / pg->bitmap->w, (double)dh / pg->bitmap->h);
+            cairo_scale(cr, (double)uw / pg->bitmap->w, (double)uh / pg->bitmap->h);
             cairo_set_source_surface(cr, bs, 0, 0);
             cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
             cairo_paint(cr);
@@ -1021,9 +1134,9 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
         }
         for (const Annotation* a : marks) {
             Color c = hex_color(a->color);
-            cairo_rectangle(cr, a->rect[0] * dw, a->rect[1] * dh,
-                            (a->rect[2] - a->rect[0]) * dw,
-                            (a->rect[3] - a->rect[1]) * dh);
+            cairo_rectangle(cr, a->rect[0] * uw, a->rect[1] * uh,
+                            (a->rect[2] - a->rect[0]) * uw,
+                            (a->rect[3] - a->rect[1]) * uh);
             set_color(cr, c, 70.0 / 255.0);
             cairo_fill_preserve(cr);
             set_color(cr, c, 230.0 / 255.0);
@@ -1034,20 +1147,23 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
         const caj::PageLayout& lay = *pg->layout;
         for (const Annotation* a : marks) {
             Color c = hex_color(a->color);
-            cairo_rectangle(cr, a->rect[0] * dw, a->rect[1] * dh,
-                            (a->rect[2] - a->rect[0]) * dw,
-                            (a->rect[3] - a->rect[1]) * dh);
+            cairo_rectangle(cr, a->rect[0] * uw, a->rect[1] * uh,
+                            (a->rect[2] - a->rect[0]) * uw,
+                            (a->rect[3] - a->rect[1]) * uh);
             set_color(cr, c, 0.42);
             cairo_fill_preserve(cr);
             set_color(cr, c, 0.9);
             cairo_set_line_width(cr, 1);
             cairo_stroke(cr);
         }
-        // 文本选区底（在文字下层）
+        // 文本选区底（在文字下层）；水平相邻/重叠的 span 合并成一个矩形，
+        // 矩形选区视觉不变，笔刷的不连续簇分开涂
         if (has_sel && sel_page == cur) {
+            struct HlRect {
+                double x0, x1, y0, y1;
+            };
+            std::vector<HlRect> groups;
             for (const auto& ln : sel_spans(lay)) {
-                double rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0;
-                bool first = true;
                 for (const Span& sp : ln) {
                     const caj::TextRun& tr = lay.texts[sp.run];
                     auto fit = lay.fonts.find(tr.font);
@@ -1060,39 +1176,65 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
                     while (i0 < i1 && g.bounds[i0] < sp.b0) i0++;
                     while (i1 > i0 && g.bounds[i1 - 1] >= sp.b1) i1--;
                     if (i0 >= i1) continue;
-                    double a = g.xs0[i0], b = g.xs1[i1 - 1];
-                    double y0s = tr.y * sc, y1s = (tr.y + tr.h) * sc;
-                    rx0 = first ? a : std::min(rx0, a);
-                    rx1 = first ? b : std::max(rx1, b);
-                    ry0 = first ? y0s : std::min(ry0, y0s);
-                    ry1 = first ? y1s : std::max(ry1, y1s);
-                    first = false;
-                }
-                if (!first) {
-                    cairo_rectangle(cr, rx0, ry0, rx1 - rx0, ry1 - ry0);
-                    set_color(cr, hex_color(SEL_FILL_HEX));
-                    cairo_fill(cr);
+                    HlRect r{g.xs0[i0], g.xs1[i1 - 1], tr.y * sc,
+                             (tr.y + tr.h) * sc};
+                    // 与上一组 x 区间相接（含 0.5px 容差）且 y 带重叠则合并
+                    if (!groups.empty()) {
+                        HlRect& p = groups.back();
+                        if (r.x0 <= p.x1 + 0.5 && r.x1 >= p.x0 - 0.5 &&
+                            r.y0 < p.y1 && r.y1 > p.y0) {
+                            p.x0 = std::min(p.x0, r.x0);
+                            p.x1 = std::max(p.x1, r.x1);
+                            p.y0 = std::min(p.y0, r.y0);
+                            p.y1 = std::max(p.y1, r.y1);
+                            continue;
+                        }
+                    }
+                    groups.push_back(r);
                 }
             }
+            for (const HlRect& g : groups) {
+                cairo_rectangle(cr, g.x0, g.y0, g.x1 - g.x0, g.y1 - g.y0);
+                set_color(cr, hex_color(SEL_FILL_HEX));
+                cairo_fill(cr);
+            }
         }
-        // 插图
+        // 插图（pdftohtml 的 width/height 可为负 = 镜像，此时 left/top 是矩形另一侧边缘）
         for (const caj::ImgRun& ir : lay.imgs) {
-            if (!ir.bmp || ir.w <= 0 || ir.h <= 0) continue;
-            cairo_surface_t* bs = bitmap_cached(pg, *ir.bmp);
-            if (!bs) continue;
-            double iw = std::max(1.0, ir.w * sc);
-            double ih = std::max(1.0, ir.h * sc);
+            if (!ir.bmp || ir.bmp->w <= 0 || ir.bmp->h <= 0) continue;
+            double x0 = std::min(ir.x, ir.x + ir.w);
+            double y0 = std::min(ir.y, ir.y + ir.h);
+            double bw = std::max(1.0, std::fabs(ir.w) * sc);
+            double bh = std::max(1.0, std::fabs(ir.h) * sc);
             cairo_save(cr);
-            cairo_rectangle(cr, ir.x * sc, ir.y * sc, iw, ih);
+            cairo_rectangle(cr, x0 * sc, y0 * sc, bw, bh);
             cairo_clip(cr);
-            cairo_scale(cr, iw / ir.bmp->w, ih / ir.bmp->h);
-            cairo_set_source_surface(cr, bs, 0, 0);
-            cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-            cairo_paint(cr);
+            // clip 已按当前（未缩放）坐标系固定，绘制前必须平移到目标位置
+            cairo_translate(cr, ir.w < 0 ? x0 * sc + bw : x0 * sc,
+                                ir.h < 0 ? y0 * sc + bh : y0 * sc);
+            cairo_scale(cr, (ir.w < 0 ? -bw : bw) / ir.bmp->w,
+                            (ir.h < 0 ? -bh : bh) / ir.bmp->h);
+            if (ir.mask) {
+                // 掩膜以墨色绘制（白色为着色区），不铺底色
+                cairo_surface_t* ms = mask_surface(*ir.bmp);
+                if (ms) {
+                    set_color(cr, hex_color(PAL_INK));
+                    cairo_mask_surface(cr, ms, 0, 0);
+                    cairo_surface_destroy(ms);
+                }
+            } else {
+                cairo_surface_t* bs = bitmap_cached(pg, *ir.bmp);
+                if (bs) {
+                    cairo_set_source_surface(cr, bs, 0, 0);
+                    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+                    cairo_paint(cr);
+                    cairo_surface_destroy(bs);
+                }
+            }
             cairo_restore(cr);
-            cairo_surface_destroy(bs);
         }
-        // 文字：锚点取各段纵向中点（同 Python 的 anchor="w"）
+        // 文字：锚点取各段纵向中点（同 Python 的 anchor="w"）；横向按 run
+        // 声明宽度微缩放，抵消本机字体与 PDF 内嵌字体的度量差
         for (const caj::TextRun& tr : lay.texts) {
             auto fit = lay.fonts.find(tr.font);
             caj::FontSpec fs = fit != lay.fonts.end() ? fit->second : caj::FontSpec();
@@ -1102,9 +1244,19 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
             pango_layout_set_text(pl, tr.text.c_str(), (int)tr.text.size());
             int tw = 0, th = 0;
             pango_layout_get_pixel_size(pl, &tw, &th);
+            double k = run_hfit(tr, sc, (double)tw);
             set_color(cr, hex_color(fs.color, Color{0, 0, 0}));
             cairo_move_to(cr, tr.x * sc, (tr.y + tr.h / 2) * sc - th / 2.0);
-            pango_cairo_show_layout(cr, pl);
+            if (k != 1.0) {
+                cairo_save(cr);
+                cairo_translate(cr, tr.x * sc, 0);
+                cairo_scale(cr, k, 1.0);
+                cairo_translate(cr, -tr.x * sc, 0);
+                pango_cairo_show_layout(cr, pl);
+                cairo_restore(cr);
+            } else {
+                pango_cairo_show_layout(cr, pl);
+            }
             g_object_unref(pl);
         }
     }
@@ -1113,19 +1265,31 @@ cairo_surface_t* App::compose(const caj::PagePtr& pg, int dw, int dh, double sc)
 }
 
 cairo_surface_t* App::page_surface(const caj::PagePtr& obj, int dw, int dh,
-                                   double sc) {
+                                   double sc, int rot) {
+    rot = ((rot % 360) + 360) % 360;
     if (psurf && ps_page == cur && ps_dw == dw && ps_dh == dh && ps_rev == rev &&
-        ps_obj == obj)
+        ps_rot == rot && ps_obj == obj)
         return psurf;
     if (psurf) {
         cairo_surface_destroy(psurf);
         psurf = nullptr;
     }
-    psurf = compose(obj, dw, dh, sc);
+    // compose 产出未旋转表面（uw×uh）；旋转在整页层做，标注/选区/文字一并跟随
+    bool swap = (rot == 90 || rot == 270);
+    int uw = swap ? dh : dw;
+    int uh = swap ? dw : dh;
+    cairo_surface_t* s = compose(obj, uw, uh, sc);
+    if (s && rot != 0) {
+        cairo_surface_t* r = rotate_surface(s, rot);
+        cairo_surface_destroy(s);
+        s = r;
+    }
+    psurf = s;
     ps_page = cur;
     ps_dw = dw;
     ps_dh = dh;
     ps_rev = rev;
+    ps_rot = rot;
     ps_obj = obj;
     return psurf;
 }
@@ -1349,9 +1513,14 @@ void App::draw(cairo_t* cr, int cw, int ch) {
         img_w = std::max(1, obj->bitmap->w);
         img_h = std::max(1, obj->bitmap->h);
     }
-    double sc = display_scale(img_w, cw);
-    int dw = std::max(1, (int)(img_w * sc));
-    int dh = std::max(1, (int)(img_h * sc));
+    int rot = eff_rot(cur);
+    bool swap = (rot == 90 || rot == 270);
+    // 定标基准是旋转后的页面宽度：横向页转 90° 后按高度铺满
+    double sc = display_scale(swap ? img_h : img_w, cw);
+    int uw = std::max(1, (int)(img_w * sc));
+    int uh = std::max(1, (int)(img_h * sc));
+    int dw = swap ? uh : uw;
+    int dh = swap ? uw : uh;
     double ch_eff = ch - 44;
     max_scroll = std::max(0.0, dh - ch_eff);
     scroll = std::max(0.0, std::min(scroll, max_scroll));
@@ -1379,13 +1548,13 @@ void App::draw(cairo_t* cr, int cw, int ch) {
 
     // 缩放预览：直接拉伸上一张整页表面，避免每个缩放步进都在主线程整页重排
     bool preview = zoom_preview && psurf && ps_page == cur && ps_obj == obj &&
-                   ps_dw > 0 && ps_dh > 0;
+                   ps_rot == rot && ps_dw > 0 && ps_dh > 0;
     cairo_surface_t* ps = nullptr;
     if (preview) {
         ps = psurf;
     } else {
         zoom_preview = false;
-        ps = page_surface(obj, dw, dh, sc);
+        ps = page_surface(obj, dw, dh, sc, rot);
     }
     if (ps) {
         cairo_save(cr);
@@ -1410,6 +1579,20 @@ void App::draw(cairo_t* cr, int cw, int ch) {
         set_color(cr, hex_color(mark_color));
         cairo_set_line_width(cr, 2);
         cairo_rectangle(cr, drag_x0, drag_y0, ptr_x - drag_x0, ptr_y - drag_y0);
+        cairo_stroke(cr);
+        cairo_restore(cr);
+    } else if (selpress && brush_mode && !brush_pts.empty()) {
+        // 笔刷拖选预览：半透明圆头笔画带
+        cairo_save(cr);
+        set_color(cr, hex_color(PAL_BRASS), 0.30);
+        cairo_set_line_width(cr, brush_r * 2);
+        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+        cairo_move_to(cr, brush_pts[0].x, brush_pts[0].y);
+        if (brush_pts.size() == 1)
+            cairo_line_to(cr, brush_pts[0].x + 0.01, brush_pts[0].y);
+        for (size_t i = 1; i < brush_pts.size(); i++)
+            cairo_line_to(cr, brush_pts[i].x, brush_pts[i].y);
         cairo_stroke(cr);
         cairo_restore(cr);
     } else if (selpress) {
@@ -1590,6 +1773,9 @@ void App::open_file() {
     }
 }
 
+// 后台渲染完成唤醒（定义在后文；Renderer 的唤醒钩子需引用它）
+gboolean drain_render_cb(gpointer ud);
+
 void App::open_path(const std::string& p) {
     GError* err = nullptr;
     char* tdp = g_dir_make_tmp("cajview_XXXXXX", &err);
@@ -1617,6 +1803,8 @@ void App::open_path(const std::string& p) {
         show_error(GTK_WINDOW(win), "无法初始化渲染器：" + base_name(p));
         return;
     }
+    // 渲染完成时从后台线程唤醒主循环（替代 60ms 轮询）
+    nrd->set_wakeup([this] { g_main_context_invoke(nullptr, drain_render_cb, this); });
     std::string old_tmp = tmp;
     path = p;
     cap = ncap;
@@ -1633,9 +1821,14 @@ void App::open_path(const std::string& p) {
     max_scroll = 0;
     flip_until = 0;
     pending_page = 0;
+    // 旋转仅本次会话，不持久化：换文档即恢复原始方向
+    rot_all = 0;
+    rot_page.clear();
     cancel_drag();
     has_sel = false;
     sel_page = 0;
+    sel_is_brush = false;
+    sel_path.clear();
     if (psurf) {
         cairo_surface_destroy(psurf);
         psurf = nullptr;
@@ -1758,6 +1951,26 @@ std::vector<std::vector<App::Span>> App::sel_spans(const caj::PageLayout& lay) {
     if (!has_sel || sel_page != cur) return lines;
     int cw = gtk_widget_get_allocated_width(canvas);
     double sc = display_scale(lay.w, cw);
+    // 笔刷：命中 = 字符中心到笔画路径距离 ≤ 半径；矩形：x0/x1/y0/y1 包围盒
+    double br = sel_r * lay.w * sc;              // 半径（缩放后页面坐标）
+    std::vector<brush::Point> bpath;             // 笔画（缩放后页面坐标）
+    double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    if (sel_is_brush) {
+        for (const brush::Point& p : sel_path) {
+            double px = p.x * lay.w * sc, py = p.y * lay.h * sc;
+            if (bpath.empty()) {
+                bx0 = bx1 = px;
+                by0 = by1 = py;
+            } else {
+                bx0 = std::min(bx0, px);
+                bx1 = std::max(bx1, px);
+                by0 = std::min(by0, py);
+                by1 = std::max(by1, py);
+            }
+            bpath.push_back({px, py});
+        }
+        if (bpath.empty()) return lines;
+    }
     double x0 = sel[0] * lay.w * sc, x1 = sel[2] * lay.w * sc;
     double y0 = sel[1] * lay.h * sc, y1 = sel[3] * lay.h * sc;
     std::vector<Span> spans;
@@ -1765,13 +1978,29 @@ std::vector<std::vector<App::Span>> App::sel_spans(const caj::PageLayout& lay) {
         const caj::TextRun& tr = lay.texts[ri];
         double mid = tr.y * sc + tr.h * sc / 2;      // 段中线
         double ty0 = tr.y * sc, ty1 = (tr.y + tr.h) * sc;
-        if (!((y0 <= mid && mid <= y1) ||
-              (std::min(y1, ty1) - std::max(y0, ty0) >= 0.5 * tr.h * sc)))
+        if (sel_is_brush) {
+            // 包围盒外扩半径的粗筛，省掉逐 run 的 Pango 度量
+            double rx0 = tr.x * sc, rx1 = (tr.x + tr.w) * sc;
+            if (bx1 + br < rx0 || bx0 - br > rx1 || by1 + br < ty0 ||
+                by0 - br > ty1)
+                continue;
+        } else if (!((y0 <= mid && mid <= y1) ||
+                     (std::min(y1, ty1) - std::max(y0, ty0) >=
+                      0.5 * tr.h * sc))) {
             continue;
+        }
         auto fit = lay.fonts.find(tr.font);
         caj::FontSpec fs = fit != lay.fonts.end() ? fit->second : caj::FontSpec();
         RunGeom g;
         run_geom(tr, fs, sc, g);
+        if (sel_is_brush) {
+            std::vector<double> mids(g.xs0.size());
+            for (size_t i = 0; i < g.xs0.size(); i++)
+                mids[i] = (g.xs0[i] + g.xs1[i]) / 2;
+            for (const auto& rg : brush::brush_ranges(mids, mid, bpath, br))
+                spans.push_back(Span{ri, g.bounds[rg.first], g.bounds[rg.second]});
+            continue;
+        }
         long i0 = -1, i1 = -1;
         for (size_t i = 0; i < g.xs0.size(); i++) {
             double cx = (g.xs0[i] + g.xs1[i]) / 2;   // 字符中点落在选区内
@@ -1863,6 +2092,8 @@ void App::copy_selection() {
 void App::clear_selection() {
     if (!has_sel) return;
     has_sel = false;
+    sel_is_brush = false;
+    sel_path.clear();
     bump_rev();
     queue_draw();
 }
@@ -1903,9 +2134,24 @@ void update_cursor(App* a) {
     GdkWindow* w = gtk_widget_get_window(a->canvas);
     if (!w) return;
     GdkCursor* c = gdk_cursor_new_for_display(
-        gdk_display_get_default(), a->mark_on ? GDK_CROSSHAIR : GDK_XTERM);
+        gdk_display_get_default(), a->mark_on ? GDK_CROSSHAIR
+                                  : (a->brush_mode ? GDK_PENCIL : GDK_XTERM));
     gdk_window_set_cursor(w, c);
     g_object_unref(c);
+}
+
+void App::toggle_brush() {
+    brush_mode = !brush_mode;
+    update_cursor(this);
+    toast_msg(brush_mode ? "笔刷选择模式（b 切回矩形）" : "矩形选择模式");
+    queue_draw();
+}
+
+void App::brush_adjust(double d) {
+    brush_r = std::max(3.0, std::min(40.0, brush_r + d));
+    char b[48];
+    snprintf(b, sizeof(b), "笔刷半径 %.0f px", brush_r);
+    toast_msg(b);
 }
 
 gboolean on_draw_cb(GtkWidget* w, cairo_t* cr, gpointer ud) {
@@ -1939,6 +2185,7 @@ gboolean on_press_cb(GtkWidget*, GdkEventButton* ev, gpointer ud) {
         a->selpress = a->cur_ready;
         a->sel_x0 = a->ptr_x = ev->x;
         a->sel_y0 = a->ptr_y = ev->y;
+        if (a->brush_mode) a->brush_pts.assign(1, {ev->x, ev->y});
         return TRUE;
     }
     if (ev->button == 3) {
@@ -1953,6 +2200,11 @@ gboolean on_motion_cb(GtkWidget*, GdkEventMotion* ev, gpointer ud) {
     if (!a->dragging && !a->selpress) return FALSE;
     a->ptr_x = ev->x;
     a->ptr_y = ev->y;
+    if (a->selpress && a->brush_mode && !a->brush_pts.empty()) {
+        const brush::Point& lp = a->brush_pts.back();   // 采样间距 ≥2px
+        if (std::hypot(ev->x - lp.x, ev->y - lp.y) >= 2.0)
+            a->brush_pts.push_back({ev->x, ev->y});
+    }
     a->queue_draw();
     return TRUE;
 }
@@ -2006,23 +2258,42 @@ gboolean on_release_cb(GtkWidget*, GdkEventButton* ev, gpointer ud) {
     double sx = a->sel_x0, sy = a->sel_y0;
     a->selpress = false;
     if (std::fabs(ev->x - sx) < 5 && std::fabs(ev->y - sy) < 5) {   // 单击：清除
+        a->brush_pts.clear();
         a->clear_selection();
         return TRUE;
     }
     caj::PagePtr obj = a->rd ? a->rd->get(a->cur) : nullptr;
     if (!obj || !obj->layout) {
+        a->brush_pts.clear();
         a->toast_msg("此页为扫描图像，无可选文字");
         return TRUE;
     }
-    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    a->norm_from_canvas(cw, ch, sx, sy, &x0, &y0);
-    a->norm_from_canvas(cw, ch, ev->x, ev->y, &x1, &y1);
     a->has_sel = true;
     a->sel_page = a->cur;
-    a->sel[0] = std::min(x0, x1);
-    a->sel[1] = std::min(y0, y1);
-    a->sel[2] = std::max(x0, x1);
-    a->sel[3] = std::max(y0, y1);
+    if (a->brush_mode) {
+        // 笔刷：笔画存归一化页面坐标，半径按页宽比存（缩放不变）
+        const caj::PageLayout& lay = *obj->layout;
+        double sc = a->display_scale(lay.w, cw);
+        a->sel_is_brush = true;
+        a->sel_path.clear();
+        for (const brush::Point& p : a->brush_pts) {
+            double nx = 0, ny = 0;
+            a->norm_from_canvas(cw, ch, p.x, p.y, &nx, &ny);
+            a->sel_path.push_back({nx, ny});
+        }
+        a->sel_r = a->brush_r / (lay.w * sc);
+        a->brush_pts.clear();
+    } else {
+        a->sel_is_brush = false;
+        a->sel_path.clear();
+        double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        a->norm_from_canvas(cw, ch, sx, sy, &x0, &y0);
+        a->norm_from_canvas(cw, ch, ev->x, ev->y, &x1, &y1);
+        a->sel[0] = std::min(x0, x1);
+        a->sel[1] = std::min(y0, y1);
+        a->sel[2] = std::max(x0, x1);
+        a->sel[3] = std::max(y0, y1);
+    }
     a->bump_rev();
     a->queue_draw();
     return TRUE;
@@ -2077,6 +2348,22 @@ gboolean on_key_cb(GtkWidget*, GdkEventKey* ev, gpointer ud) {
         case GDK_KEY_minus:
         case GDK_KEY_KP_Subtract:
             a->zoom_out();
+            return TRUE;
+        case GDK_KEY_r:
+            a->rotate_page();
+            return TRUE;
+        case GDK_KEY_R:
+            a->rotate_all_pages();
+            return TRUE;
+        case GDK_KEY_b:
+        case GDK_KEY_B:
+            a->toggle_brush();
+            return TRUE;
+        case GDK_KEY_bracketleft:
+            a->brush_adjust(-2);
+            return TRUE;
+        case GDK_KEY_bracketright:
+            a->brush_adjust(2);
             return TRUE;
         case GDK_KEY_Escape:
             a->clear_selection();
@@ -2142,16 +2429,17 @@ void on_mark_color(GtkMenuItem* item, gpointer ud) {
     a->queue_draw();
 }
 
-gboolean poll_render_cb(gpointer ud) {
+// 后台渲染结果收割：由渲染线程经 g_main_context_invoke 投递到主线程执行一次。
+gboolean drain_render_cb(gpointer ud) {
     App* a = (App*)ud;
-    if (!a->rd) return G_SOURCE_CONTINUE;   // 空界面阶段保持轮询
+    if (!a->rd) return G_SOURCE_REMOVE;
     for (auto& t : a->rd->drain()) {
         try {
             std::get<0>(t)(std::get<1>(t), std::get<2>(t));
         } catch (...) {
         }
     }
-    return G_SOURCE_CONTINUE;
+    return G_SOURCE_REMOVE;
 }
 
 // 已带文件路径启动：界面出现后再加载文档
@@ -2168,12 +2456,7 @@ gboolean choose_file_cb(gpointer ud) {
     return G_SOURCE_REMOVE;
 }
 
-void on_destroy_cb(GtkWidget*, gpointer ud) {
-    App* a = (App*)ud;
-    if (a->poll_id) {
-        g_source_remove(a->poll_id);
-        a->poll_id = 0;
-    }
+void on_destroy_cb(GtkWidget*, gpointer) {
     gtk_main_quit();
 }
 
@@ -2251,6 +2534,8 @@ void build_ui(App* a) {
     const std::pair<const char*, void (*)(App*)> tools[] = {
         {"放大", [](App* p) { p->zoom_in(); }},
         {"缩小", [](App* p) { p->zoom_out(); }},
+        {"旋转本页", [](App* p) { p->rotate_page(); }},
+        {"旋转全部", [](App* p) { p->rotate_all_pages(); }},
         {"格式信息", [](App* p) { p->show_info(); }},
     };
     for (const auto& n : tools) {
@@ -2331,9 +2616,6 @@ void build_ui(App* a) {
 
     g_signal_connect(a->win, "key-press-event", G_CALLBACK(on_key_cb), a);
     g_signal_connect(a->win, "destroy", G_CALLBACK(on_destroy_cb), a);
-
-    // 后台渲染完成的轮询（空界面阶段也保持运行）
-    a->poll_id = g_timeout_add(60, poll_render_cb, a);
 }
 
 const char* USAGE =

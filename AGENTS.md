@@ -41,12 +41,16 @@ CAJ / KDH 文献阅读器。`caj_viewer.py` 是已验证的行为基准，`src/`
 
 ## GUI 约定
 
-- 整页渲染结果缓存进 cairo surface，key = 页号 + dw + dh + `rev`；标注/选区变化时必须 `bump_rev()` 使其失效。
+- 整页渲染结果缓存进 cairo surface，key = 页号 + dw + dh + `rev` + 旋转角；标注/选区变化时必须 `bump_rev()` 使其失效。
 - 可视区高度 = 窗口高 − 44（页脚）；`top_y = (ch_eff - dh) / 2`（短页居中）或 `-scroll`。
+- **页面旋转（C++ 版新增，Python 版没有）**：`rot_all`（全部页）+ `rot_page[页]`（单页）叠加，`eff_rot(n)` 取模 360。它是**视图级状态、仅本次会话**：换文档即 `open_path` 重置，不写 sidecar。实现层次是「`compose` 产出**未旋转**的 uw×uh 表面 → `rotate_surface` 在整页表面层旋转」，因此标注/选区/文字/插图一并跟随；鼠标坐标由 `norm_from_canvas` 做**逆旋转**映射回未旋转页面空间（标注坐标语义不变）。横向页按「旋转后宽度」定标。快捷键 `r` 旋转本页、`R` 旋转全部。
 - **空文档状态必须安全**：`rd == nullptr` 时 `draw()` 走 `draw_welcome` 早退，所有事件回调都要有 `rd` / `cur_ready` 守卫。
 - 启动流程固定为：建界面 → `gtk_widget_show_all` → `g_idle_add` 加载命令行文件或弹文件选择框。不要改成启动前先加载/先弹框。
 - 颜色一律用 `PAL_*` 常量（`PAL_DESK` / `PAL_PANEL` / `PAL_PAPER` / `PAL_INK` / `PAL_BRASS` / `PAL_MUTED`），标注色用 `MARK_HEX[]`，不要就地写十六进制。
 - 渲染子进程（pdftohtml / pdftoppm / pdffonts）必须带 GCancellable 看门狗，别留下僵尸进程。
+- **后台渲染不轮询**（C++ 版有意差异）：`Renderer::get_async` 完成时经 `set_wakeup` 钩子（`open_path` 里注册）用 `g_main_context_invoke(nullptr, drain_render_cb, this)` 唤醒主循环，主线程**一次性** `drain()`。钩子会在后台渲染线程触发：实现须线程安全，且必须**先在锁内取 `wakeup_` 副本、解锁后再调用**（`~Renderer` 可能在解锁后析构对象）。不要改回 `g_timeout_add` 轮询。
+- **位图页输出 PPM 而非 PNG**（C++ 版有意差异）：`render_bitmap` 调 `pdftoppm` 时**不指定格式开关** —— `pdftoppm` 没有 `-ppm` 选项，PPM(P6) 就是「不指定格式」时的默认输出，传 `-ppm` 会被当非法参数直接报错、不产文件。gdk-pixbuf 内置 PNM loader，无需新依赖。实测 120dpi 单页 1.7s → 0.3s。
+- 页级 LRU 上限 `Renderer::max_ = 24`（位图页约 5.5MB/页 @120dpi）。
 
 ## 禁令
 

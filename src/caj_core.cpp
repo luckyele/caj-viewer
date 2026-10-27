@@ -70,8 +70,10 @@ std::string base_name(const std::string& p) {
 }
 
 std::string join_path(const std::string& a, const std::string& b) {
-    if (a.empty()) return b;
-    if (!a.empty() && a[a.size() - 1] == '/') return a + b;
+    // 同 Python 的 os.path.join：b 为绝对路径时直接返回 b。
+    // pdftohtml 以绝对路径调用时会写出绝对 src，拼前缀反而会毁掉路径。
+    if (a.empty() || (!b.empty() && b[0] == '/')) return b;
+    if (a[a.size() - 1] == '/') return a + b;
     return a + "/" + b;
 }
 
@@ -450,6 +452,20 @@ std::shared_ptr<Bitmap> bitmap_from_pixbuf(GdkPixbuf* pb) {
         }
     }
     return b;
+}
+
+// pdftohtml 只对 PDF 的 image mask（stencil）输出 1 位灰度 PNG（实测：
+// 普通 1 位灰度图会被渲染成 8 位 RGB）。这种图“白 = 着色区”，需按掩膜处理。
+bool is_1bit_gray_png(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char h[26];
+    size_t n = fread(h, 1, sizeof(h), f);
+    fclose(f);
+    static const unsigned char sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (n < sizeof(h)) return false;
+    if (memcmp(h, sig, sizeof(sig)) != 0 || memcmp(h + 12, "IHDR", 4) != 0) return false;
+    return h[24] == 1 && h[25] == 0;    // 位深 1、颜色类型 0（灰度）
 }
 
 std::shared_ptr<Bitmap> load_bitmap_file(const std::string& path) {
@@ -1448,6 +1464,7 @@ void layout_start(GMarkupParseContext*, const gchar* name, const gchar** anames,
         ir.y = gattr_num(anames, avalues, "top", 0);
         ir.w = iw;
         ir.h = ih;
+        ir.mask = is_1bit_gray_png(path);
         ir.bmp = bmp;
         c->out->imgs.push_back(ir);
         return;
@@ -1564,15 +1581,19 @@ std::shared_ptr<const Bitmap> Renderer::render_bitmap(int n) {
     // 每次渲染使用唯一前缀，避免并发渲染互相干扰/误删文件
     std::string prefix = join_path(dir_name(pdf_path_),
                                    "pg_" + std::to_string(n) + "_" + uuid_hex());
+    // 输出 PPM（P6 原始像素）而非 PNG：光栅化成本相同，但省掉 PNG 编码
+    // （实测 120dpi 单页 1.7s -> 0.3s）与解码（0.08s -> 0.01s）。
+    // 注意 pdftoppm 没有 -ppm 开关，PPM 就是「不指定格式」时的默认输出；
+    // 传 -ppm 会被当成非法参数直接报错。gdk-pixbuf 内置 PNM loader，无需新依赖。
     RunResult r = run_capture({"pdftoppm", "-f", std::to_string(n), "-l",
-                               std::to_string(n), "-png", "-r", std::to_string(dpi_),
+                               std::to_string(n), "-r", std::to_string(dpi_),
                                pdf_path_, prefix},
                               "", 30000);
     if (!r.ok) return nullptr;
-    std::string png = find_first_match(dir_name(prefix), base_name(prefix) + "-", ".png");
-    if (png.empty()) return nullptr;
-    auto bmp = load_bitmap_file(png);
-    remove(png.c_str());
+    std::string img = find_first_match(dir_name(prefix), base_name(prefix) + "-", ".ppm");
+    if (img.empty()) return nullptr;
+    auto bmp = load_bitmap_file(img);
+    remove(img.c_str());
     return bmp;
 }
 
@@ -1657,6 +1678,7 @@ void Renderer::get_async(int n, PageCallback cb) {
             res = nullptr;
         }
         std::vector<PageCallback> cbs;
+        std::function<void()> wk;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = inflight_.find(n);
@@ -1670,8 +1692,10 @@ void Renderer::get_async(int n, PageCallback cb) {
             std::lock_guard<std::mutex> lk(mu_);
             for (auto& c : cbs) done_.emplace_back(c, n, res);
             running_--;
+            wk = wakeup_;      // 先取出副本：解锁后本对象可能已被析构
         }
         cv_.notify_all();
+        if (wk) wk();
     }).detach();
 }
 
@@ -1680,6 +1704,11 @@ std::vector<std::tuple<PageCallback, int, PagePtr>> Renderer::drain() {
     std::lock_guard<std::mutex> lk(mu_);
     out.swap(done_);
     return out;
+}
+
+void Renderer::set_wakeup(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    wakeup_ = std::move(fn);
 }
 
 }  // namespace caj

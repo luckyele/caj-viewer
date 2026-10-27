@@ -72,7 +72,8 @@ struct TextRun {
 };
 
 struct ImgRun {
-    double x = 0, y = 0, w = 0, h = 0;
+    double x = 0, y = 0, w = 0, h = 0;  // w/h 可为负：表示镜像，x/y 为矩形另一侧边缘
+    bool mask = false;                  // PDF image mask（stencil）：白色区域为着色区
     std::shared_ptr<const Bitmap> bmp;
 };
 
@@ -109,6 +110,10 @@ public:
     // 取回已完成的渲染结果（须在 GUI 主线程调用）。
     std::vector<std::tuple<PageCallback, int, PagePtr>> drain();
 
+    // 每当有新结果进入 drain() 队列时被调用，用于唤醒主循环（替代轮询）。
+    // 可能在后台渲染线程触发：实现须线程安全，且不得回调本对象的方法。
+    void set_wakeup(std::function<void()> fn);
+
 private:
     void lru_touch(int n);              // 需持锁调用
     void store(int n, PagePtr p);       // 写入 LRU 缓存
@@ -126,11 +131,14 @@ private:
     std::vector<int> lru_;
     std::map<int, std::vector<PageCallback>> inflight_;
     std::vector<std::tuple<PageCallback, int, PagePtr>> done_;
+    std::function<void()> wakeup_;      // 结果入队时的唤醒钩子（mu_ 保护）
     // 后台渲染线程计数：析构前等待归零，避免线程继续访问已析构的成员
     int running_ = 0;
     std::condition_variable cv_;
     bool closing_ = false;
-    size_t max_ = 10;
+    // 页级 LRU 上限。位图页约 5.5MB/页（120dpi），24 页最坏约 130MB；
+    // 文本页只存版面结构，占用很小。
+    size_t max_ = 24;
     int dpi_ = 120;
 };
 

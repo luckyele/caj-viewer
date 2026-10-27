@@ -31,6 +31,7 @@ find_package(ZLIB REQUIRED)
 add_executable(caj-viewer
   src/caj_viewer.cpp
   src/caj_core.cpp
+  src/sel_brush.cpp
 )
 target_include_directories(caj-viewer PRIVATE src)
 target_compile_options(caj-viewer PRIVATE -Wall -Wextra)
@@ -40,5 +41,12 @@ target_link_libraries(caj-viewer PRIVATE
   ZLIB::ZLIB
   ${CMAKE_DL_LIBS}
 )
+
+# 纯几何单元测试（无 GTK 依赖）
+enable_testing()
+add_executable(test_sel_brush tests/test_sel_brush.cpp src/sel_brush.cpp)
+target_include_directories(test_sel_brush PRIVATE src)
+target_compile_options(test_sel_brush PRIVATE -Wall -Wextra)
+add_test(NAME sel_brush COMMAND test_sel_brush)
 
 install(TARGETS caj-viewer RUNTIME DESTINATION bin)
